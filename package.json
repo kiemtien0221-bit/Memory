@@ -1,0 +1,16 @@
+{
+  "name": "kami-mp3-api",
+  "version": "1.0.0",
+  "description": "KamiMp3 Backend API - Music sharing platform",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.28.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
