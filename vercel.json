@@ -4,6 +4,10 @@
     { "src": "api/**/*.js", "use": "@vercel/node" }
   ],
   "routes": [
+    { "src": "/api/auth/change-password", "dest": "/api/auth.js?action=change-password" },
+    { "src": "/api/auth/check", "dest": "/api/auth.js?action=check" },
+    { "src": "/api/auth/profile", "dest": "/api/auth.js?action=profile" },
+    { "src": "/api/auth", "dest": "/api/auth.js" },
     { "src": "/api/(.*)", "dest": "/api/$1.js" }
   ]
 }
