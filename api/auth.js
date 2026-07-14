@@ -1,4 +1,3 @@
-
 import { Redis } from '@upstash/redis';
 import crypto from 'crypto';
 
@@ -16,7 +15,11 @@ if (REDIS_ENABLED) {
   }
 }
 
-// Hash đơn giản (không dùng bcrypt vì serverless)
+// TTL constants (đồng bộ với chat.js)
+const AUTH_TTL_SECONDS = 365 * 86400;      // 365 ngày - giống user:profile
+const SESSION_TTL_SECONDS = 30 * 86400;    // 30 ngày - giống chat history
+const MAPPING_TTL_SECONDS = 365 * 86400;   // 365 ngày - giống auth:user
+
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password + 'kami_salt_2024').digest('hex');
 }
@@ -55,10 +58,16 @@ async function getHashData(key) {
   return {};
 }
 
+async function setExpire(key, ttl) {
+  if (redis) {
+    return await redis.expire(key, ttl);
+  }
+  return true;
+}
+
 // ============ AUTH HANDLER ============
 
 export default async function handler(req, res) {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -86,7 +95,6 @@ export default async function handler(req, res) {
 
     // === ĐĂNG NHẬP ===
     if (existingUser && existingUser.userId) {
-      // Kiểm tra mật khẩu (nếu có)
       if (existingUser.passwordHash && password) {
         const inputHash = hashPassword(password);
         if (inputHash !== existingUser.passwordHash) {
@@ -97,11 +105,14 @@ export default async function handler(req, res) {
         }
       }
 
-      // Cập nhật lastLogin
+      // Cập nhật lastLogin + refresh TTL
       await setHashData(userKey, {
         ...existingUser,
         lastLogin: Date.now().toString()
-      });
+      }, AUTH_TTL_SECONDS);
+
+      // Refresh TTL cho mapping userid -> username
+      await setExpire(`auth:userid:${existingUser.userId}`, MAPPING_TTL_SECONDS);
 
       return res.status(200).json({
         success: true,
@@ -124,10 +135,10 @@ export default async function handler(req, res) {
       createdAt: Date.now().toString(),
       lastLogin: Date.now().toString(),
       deviceCount: '1'
-    }, 365 * 86400); // TTL 1 năm
+    }, AUTH_TTL_SECONDS);
 
-    // Tạo mapping userId -> username (để tìm ngược lại)
-    await setData(`auth:userid:${newUserId}`, usernameLower, 365 * 86400);
+    // Tạo mapping userId -> username với TTL 365 ngày
+    await setData(`auth:userid:${newUserId}`, usernameLower, MAPPING_TTL_SECONDS);
 
     return res.status(200).json({
       success: true,
@@ -160,6 +171,10 @@ export default async function handler(req, res) {
         valid: false
       });
     }
+
+    // Refresh TTL khi check session (giữ account active)
+    await setExpire(userKey, AUTH_TTL_SECONDS);
+    await setExpire(`auth:userid:${userData.userId}`, MAPPING_TTL_SECONDS);
 
     return res.status(200).json({
       success: true,
@@ -204,7 +219,7 @@ export default async function handler(req, res) {
     await setHashData(userKey, {
       ...userData,
       passwordHash: newHash
-    });
+    }, AUTH_TTL_SECONDS);
 
     return res.status(200).json({
       success: true,
@@ -234,7 +249,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // Không trả passwordHash
     const { passwordHash, ...safeData } = userData;
 
     return res.status(200).json({
