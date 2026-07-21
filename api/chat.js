@@ -462,7 +462,7 @@ async function shouldSearch(message, groq) {
           content: `Need internet search? "${message}"`
         }
       ],
-      model: 'llama-3.1-8b-instant',
+      model: 'openai/gpt-oss-20b',
       temperature: 0,
       max_tokens: 50,
       response_format: { type: "json_object" }
@@ -642,7 +642,7 @@ async function createNewSummary(groq, messages, summaryNumber) {
           content: `Tóm tắt phần ${summaryNumber}:\n${JSON.stringify(messages)}`
         }
       ],
-      model: 'llama-3.1-8b-instant',
+      model: 'openai/gpt-oss-20b',
       temperature: 0.3,
       max_tokens: 400
     });
@@ -736,7 +736,7 @@ Chỉ trả về JSON, không có text thừa. Nếu không có thông tin nào 
           content: JSON.stringify(conversationHistory.slice(-10))
         }
       ],
-      model: 'llama-3.1-8b-instant',
+      model: 'openai/gpt-oss-20b',
       temperature: 0.1,
       max_tokens: 500
     });
@@ -835,7 +835,7 @@ async function callGroqWithRetry(userId, messages) {
 
       const chatCompletion = await groq.chat.completions.create({
         messages,
-        model: 'llama-3.3-70b-versatile',
+        model: 'qwen/qwen3-32b',
         temperature: 0.7,
         max_tokens: 2048,
         top_p: 0.9,
@@ -936,7 +936,7 @@ async function handleVisionRequest(req, res) {
 
     const chatCompletion = await callTempGroqWithRetry(userId, async (groq) => {
       return groq.chat.completions.create({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+        model: 'qwen/qwen3.6-27b',
         messages: [
           {
             role: 'system',
@@ -1385,7 +1385,7 @@ ${searchSection}
         storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
         searchUsed: !!searchResult,
         searchSource: searchResult?.source || null,
-        modelUsed: 'llama-3.3-70b-versatile',
+        modelUsed: 'qwen/qwen3-32b',
         cached: false
       }
     });
