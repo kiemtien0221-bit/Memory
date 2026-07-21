@@ -211,6 +211,46 @@ function safeParseJSON(text, fallback = {}) {
   }
 }
 
+function stripThinking(content) {
+  if (!content || typeof content !== 'string') return content;
+
+  // 1. Lọc <think>...</think> tags (Qwen/QwQ reasoning format)
+  content = content.replace(/<think[\s\S]*?<\/think>/gi, '');
+
+  // 2. Lọc các đoạn reasoning tiếng Anh thường gặp ở đầu
+  // Pattern: "Based on...", "Looking at...", "I can see...", "The image shows..."
+  // Kết thúc bằng dấu chấm + xuống dòng hoặc dấu chấm + khoảng trắng
+  const reasoningPatterns = [
+    /^Based on[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^Looking at[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^I can see[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^The image shows[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^From what I can observe[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^Analyzing the image[\s\S]*?\.(?:
+|\s{2,})/i,
+    /^However, exact[\s\S]*?imprecise\./i,
+  ];
+
+  for (const pattern of reasoningPatterns) {
+    content = content.replace(pattern, '');
+  }
+
+  // 3. Nếu content có cả tiếng Anh + tiếng Việt, ưu tiên giữ phần tiếng Việt
+  // Tìm đoạn bắt đầu bằng tiếng Việt (có dấu)
+  const vietnameseMatch = content.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\s\S]*/);
+  if (vietnameseMatch && vietnameseMatch[0].length > content.length * 0.3) {
+    content = vietnameseMatch[0];
+  }
+
+  // 4. Xóa dòng trống thừa ở đầu và cuối
+  return content.trim();
+}
+
 async function retryWithBackoff(fn, maxRetries = 2) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -940,7 +980,7 @@ async function handleVisionRequest(req, res) {
         messages: [
           {
             role: 'system',
-            content: 'Trả lời bằng văn xuôi tự nhiên, ngắn gọn, súc tích. Tuyệt đối không dùng markdown: không dùng **, *, ##, ###, không dùng danh sách bullet hay số thứ tự trừ khi người dùng yêu cầu. Trả lời bằng ngôn ngữ tiếng Việt.'
+            content: 'Trả lời bằng văn xuôi tự nhiên, ngắn gọn, súc tích. Tuyệt đối không dùng markdown: không dùng **, *, ##, ###, không dùng danh sách bullet hay số thứ tự trừ khi người dùng yêu cầu. Trả lời bằng tiếng Việt. KHÔNG giải thích quá trình suy nghĩ, KHÔNG dùng từ "Based on", "Looking at", "I think". Trả lời trực tiếp kết quả.'
           },
           {
             role: 'user',
@@ -963,7 +1003,15 @@ async function handleVisionRequest(req, res) {
       });
     });
 
-    const result = chatCompletion.choices[0]?.message?.content || 'Không thể phân tích ảnh';
+    let result = chatCompletion.choices[0]?.message?.content || 'Không thể phân tích ảnh';
+
+    // Lọc phần thinking/reasoning của model
+    result = stripThinking(result);
+
+    // Fallback nếu lọc xong bị rỗng
+    if (!result || result.trim() === '') {
+      result = 'Không thể phân tích ảnh';
+    }
 
     // Validate history trước khi push
     const finalConversationId = conversationId || 'default';
