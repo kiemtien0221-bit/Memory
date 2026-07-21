@@ -218,21 +218,13 @@ function stripThinking(content) {
   content = content.replace(/<think[\s\S]*?<\/think>/gi, '');
 
   // 2. Lọc các đoạn reasoning tiếng Anh thường gặp ở đầu
-  // Pattern: "Based on...", "Looking at...", "I can see...", "The image shows..."
-  // Kết thúc bằng dấu chấm + xuống dòng hoặc dấu chấm + khoảng trắng
   const reasoningPatterns = [
-    /^Based on[\s\S]*?\.(?:
-|\s{2,})/i,
-    /^Looking at[\s\S]*?\.(?:
-|\s{2,})/i,
-    /^I can see[\s\S]*?\.(?:
-|\s{2,})/i,
-    /^The image shows[\s\S]*?\.(?:
-|\s{2,})/i,
-    /^From what I can observe[\s\S]*?\.(?:
-|\s{2,})/i,
-    /^Analyzing the image[\s\S]*?\.(?:
-|\s{2,})/i,
+    /^Based on[\s\S]*?\.(?:\n|\s{2,})/i,
+    /^Looking at[\s\S]*?\.(?:\n|\s{2,})/i,
+    /^I can see[\s\S]*?\.(?:\n|\s{2,})/i,
+    /^The image shows[\s\S]*?\.(?:\n|\s{2,})/i,
+    /^From what I can observe[\s\S]*?\.(?:\n|\s{2,})/i,
+    /^Analyzing the image[\s\S]*?\.(?:\n|\s{2,})/i,
     /^However, exact[\s\S]*?imprecise\./i,
   ];
 
@@ -241,7 +233,6 @@ function stripThinking(content) {
   }
 
   // 3. Nếu content có cả tiếng Anh + tiếng Việt, ưu tiên giữ phần tiếng Việt
-  // Tìm đoạn bắt đầu bằng tiếng Việt (có dấu)
   const vietnameseMatch = content.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\s\S]*/);
   if (vietnameseMatch && vietnameseMatch[0].length > content.length * 0.3) {
     content = vietnameseMatch[0];
