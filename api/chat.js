@@ -835,7 +835,7 @@ async function callGroqWithRetry(userId, messages) {
 
       const chatCompletion = await groq.chat.completions.create({
         messages,
-        model: 'qwen/qwen3-32b',
+        model: 'openai/gpt-oss-120b',
         temperature: 0.7,
         max_tokens: 2048,
         top_p: 0.9,
@@ -940,7 +940,7 @@ async function handleVisionRequest(req, res) {
         messages: [
           {
             role: 'system',
-            content: 'Trả lời bằng văn xuôi tự nhiên, ngắn gọn, súc tích. Tuyệt đối không dùng markdown: không dùng **, *, ##, ###, không dùng danh sách bullet hay số thứ tự trừ khi người dùng yêu cầu. Trả lời bằng ngôn ngữ người dùng đang dùng.'
+            content: 'Trả lời bằng văn xuôi tự nhiên, ngắn gọn, súc tích. Tuyệt đối không dùng markdown: không dùng **, *, ##, ###, không dùng danh sách bullet hay số thứ tự trừ khi người dùng yêu cầu. Trả lời bằng ngôn ngữ tiếng Việt.'
           },
           {
             role: 'user',
@@ -1385,7 +1385,7 @@ ${searchSection}
         storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
         searchUsed: !!searchResult,
         searchSource: searchResult?.source || null,
-        modelUsed: 'qwen/qwen3-32b',
+        modelUsed: 'openai/gpt-oss-120b',
         cached: false
       }
     });
