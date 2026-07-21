@@ -900,7 +900,7 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 1024,
+        max_tokens: 2048,
         top_p: 0.9,
         stream: false
       });
@@ -1029,7 +1029,7 @@ async function handleVisionRequest(req, res) {
             ]
           }
         ],
-        max_tokens: 1024,
+        max_tokens: 2048,
         temperature: 0.7
       });
     });
@@ -1079,7 +1079,7 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 3.5);
 }
 
-function truncateMessagesToFit(messages, maxTokens = 6500, reserveTokens = 1024) {
+function truncateMessagesToFit(messages, maxTokens = 6500, reserveTokens = 2048) {
   const available = maxTokens - reserveTokens;
   let total = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -1365,7 +1365,7 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
     };
 
     let messages = [systemPrompt, ...workingMemory];
-    messages = truncateMessagesToFit(messages, 8000, 1024);
+    messages = truncateMessagesToFit(messages, 8000, 2048);
     console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
