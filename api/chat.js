@@ -91,7 +91,7 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 const MEMORY_CONFIG = {
   SHORT_TERM_DAYS: 30,
-  WORKING_MEMORY_LIMIT: 20,
+  WORKING_MEMORY_LIMIT: 10,
   LONG_TERM_DAYS: 365,
   SUMMARY_THRESHOLD: 40,
   MAX_SUMMARIES: 30,
@@ -900,7 +900,7 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 2048,
+        max_tokens: 1024,
         top_p: 0.9,
         stream: false
       });
@@ -913,6 +913,10 @@ async function callGroqWithRetry(userId, messages) {
         error.message?.includes('quota') ||
         error.message?.includes('rate limit') ||
         error.message?.includes('Rate limit') ||
+        error.message?.includes('rate_limit') ||
+        error.message?.includes('tokens per minute') ||
+        error.message?.includes('Limit 8000') ||
+        error.code === 'rate_limit_exceeded' ||
         error.status === 429 ||
         error.status === 403;
 
@@ -950,6 +954,10 @@ async function callTempGroqWithRetry(userId, fn) {
         error.message?.includes('quota') ||
         error.message?.includes('rate limit') ||
         error.message?.includes('Rate limit') ||
+        error.message?.includes('rate_limit') ||
+        error.message?.includes('tokens per minute') ||
+        error.message?.includes('Limit 8000') ||
+        error.code === 'rate_limit_exceeded' ||
         error.status === 429 ||
         error.status === 403;
 
@@ -1065,6 +1073,23 @@ async function handleVisionRequest(req, res) {
   }
 }
 // ============ END VISION HANDLER ============
+
+function estimateTokens(text) {
+  // ~3.5 ký tự = 1 token cho tiếng Việt/Anh
+  return Math.ceil((text || '').length / 3.5);
+}
+
+function truncateMessagesToFit(messages, maxTokens = 6500, reserveTokens = 1024) {
+  const available = maxTokens - reserveTokens;
+  let total = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    total += estimateTokens(messages[i].content || '');
+    if (total > available && i < messages.length - 1) {
+      return messages.slice(i + 1);
+    }
+  }
+  return messages;
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -1339,9 +1364,9 @@ Nguyên tắc: Ưu tiên sự thật, không bịa đặt. Nếu không chắc t
 Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch lạc, có cấu trúc. Trả lời bằng tiếng Việt.`
     };
 
-    const messages = [systemPrompt, ...workingMemory];
-
-    console.log(`🤖 Calling AI with ${workingMemory.length} messages...`);
+    let messages = [systemPrompt, ...workingMemory];
+    messages = truncateMessagesToFit(messages, 8000, 1024);
+    console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
 
