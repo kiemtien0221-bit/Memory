@@ -214,32 +214,33 @@ function safeParseJSON(text, fallback = {}) {
 function stripThinking(content) {
   if (!content || typeof content !== 'string') return content;
 
-  // 1. Lọc <think>...</think> tags (Qwen/QwQ reasoning format)
+  // 1. Lọc <think>...** tags (Qwen/QwQ reasoning format)
   content = content.replace(/<think[\s\S]*?<\/think>/gi, '');
 
-  // 2. Lọc các đoạn reasoning tiếng Anh thường gặp ở đầu
-  const reasoningPatterns = [
-    /^Based on[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^Looking at[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^I can see[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^The image shows[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^From what I can observe[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^Analyzing the image[\s\S]*?\.(?:\n|\s{2,})/i,
-    /^However, exact[\s\S]*?imprecise\./i,
-  ];
-
-  for (const pattern of reasoningPatterns) {
-    content = content.replace(pattern, '');
+  // 2. Nếu có "Final Polish" → chỉ giữ phần SAU nó (đó là câu trả lời cuối)
+  const finalPolishMatch = content.match(/(?:\*\*)?Final Polish[^:\n]*:[\s\n]*/i);
+  if (finalPolishMatch) {
+    const idx = content.indexOf(finalPolishMatch[0]) + finalPolishMatch[0].length;
+    content = content.substring(idx);
+  } else {
+    // 3. Nếu có "Refining" mà không có "Final Polish" → cắt từ "Refining" trở đi
+    const refiningMatch = content.match(/(?:\*\*)?Refining[^:\n]*:?[\s\n]*/i);
+    if (refiningMatch) {
+      const idx = content.indexOf(refiningMatch[0]);
+      content = content.substring(0, idx);
+    }
   }
 
-  // 3. Nếu content có cả tiếng Anh + tiếng Việt, ưu tiên giữ phần tiếng Việt
-  const vietnameseMatch = content.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\s\S]*/);
-  if (vietnameseMatch && vietnameseMatch[0].length > content.length * 0.3) {
-    content = vietnameseMatch[0];
-  }
+  // 4. Xóa markdown ** còn sót
+  content = content.replace(/\*\*/g, '');
 
-  // 4. Xóa dòng trống thừa ở đầu và cuối
-  return content.trim();
+  // 5. Xóa bullet points đầu dòng còn sót
+  content = content.replace(/^[-•]\s+/gm, '');
+
+  // 6. Xóa dòng trống thừa
+  content = content.replace(/\n{3,}/g, '\n\n').trim();
+
+  return content;
 }
 
 async function retryWithBackoff(fn, maxRetries = 2) {
