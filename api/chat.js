@@ -214,20 +214,45 @@ function safeParseJSON(text, fallback = {}) {
 function stripThinking(content) {
   if (!content || typeof content !== 'string') return content;
 
-  // 1. Lọc <think>...** tags (Qwen/QwQ reasoning format)
+  // 1. Lọc <think>...** tags (nếu có)
   content = content.replace(/<think[\s\S]*?<\/think>/gi, '');
 
-  // 2. Nếu có "Final Polish" → chỉ giữ phần SAU nó (đó là câu trả lời cuối)
-  const finalPolishMatch = content.match(/(?:\*\*)?Final Polish[^:\n]*:[\s\n]*/i);
-  if (finalPolishMatch) {
-    const idx = content.indexOf(finalPolishMatch[0]) + finalPolishMatch[0].length;
-    content = content.substring(idx);
+  // 2. Các marker chuyển tiếp từ "thinking" sang "final answer"
+  // Tìm marker CUỐI CÙNG trong danh sách, chỉ giữ phần SAU nó
+  const transitionMarkers = [
+    /Drafting the response[\s\S]*?:[\s\n]*/i,
+    /Final Polish[\s\S]*?:[\s\n]*/i,
+    /Refining[\s\S]*?:[\s\n]*/i,
+    /Synthesizing[\s\S]*?:[\s\n]*/i,
+    /Answer:[\s\n]*/i,
+    /Kết luận:[\s\n]*/i,
+    /Trả lời:[\s\n]*/i,
+  ];
+
+  let lastMarkerEnd = -1;
+  for (const marker of transitionMarkers) {
+    const match = content.match(marker);
+    if (match) {
+      const idx = content.lastIndexOf(match[0]);
+      const endIdx = idx + match[0].length;
+      if (endIdx > lastMarkerEnd) {
+        lastMarkerEnd = endIdx;
+      }
+    }
+  }
+
+  if (lastMarkerEnd !== -1) {
+    content = content.substring(lastMarkerEnd);
   } else {
-    // 3. Nếu có "Refining" mà không có "Final Polish" → cắt từ "Refining" trở đi
-    const refiningMatch = content.match(/(?:\*\*)?Refining[^:\n]*:?[\s\n]*/i);
-    if (refiningMatch) {
-      const idx = content.indexOf(refiningMatch[0]);
-      content = content.substring(0, idx);
+    // 3. Không tìm thấy marker → thử tìm đoạn tiếng Việt đầu tiên (có dấu)
+    // Nếu phần đầu toàn tiếng Anh (thinking), cắt bỏ
+    const vnMatch = content.match(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ][\s\S]*/);
+    if (vnMatch) {
+      const vnIdx = content.indexOf(vnMatch[0]);
+      // Nếu trước đoạn tiếng Việt có ít nhất 200 ký tự tiếng Anh → cắt bỏ phần Anh
+      if (vnIdx > 200) {
+        content = vnMatch[0];
+      }
     }
   }
 
@@ -240,7 +265,13 @@ function stripThinking(content) {
   // 6. Xóa dòng trống thừa
   content = content.replace(/\n{3,}/g, '\n\n').trim();
 
-  return content;
+  // 7. Nếu vẫn bắt đầu bằng tiếng Anh → cắt đến khi gặp tiếng Việt
+  const vnStart = content.search(/[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]/);
+  if (vnStart > 50) {
+    content = content.substring(vnStart);
+  }
+
+  return content.trim();
 }
 
 async function retryWithBackoff(fn, maxRetries = 2) {
