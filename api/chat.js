@@ -91,7 +91,7 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 const MEMORY_CONFIG = {
   SHORT_TERM_DAYS: 30,
-  WORKING_MEMORY_LIMIT: 30,
+  WORKING_MEMORY_LIMIT: 20,
   LONG_TERM_DAYS: 365,
   SUMMARY_THRESHOLD: 40,
   MAX_SUMMARIES: 30,
@@ -1322,7 +1322,7 @@ ${JSON.stringify(searchResult, null, 2)}
 
     const systemPrompt = {
       role: 'system',
-      content: `Bạn là Kami – AI thông minh có tư duy phân tích sắc bén, hiểu biết rộng về khoa học, công nghệ, toán học, tâm lý học và đời sống thực tế. Được tạo ra bởi Nguyễn Đức Thạnh.
+      content: `Bạn là Kami – AI thông minh được tạo ra bởi Nguyễn Đức Thạnh.
 📅 Ngày hiện tại: ${currentDate}
 
 ${Object.keys(userProfile).length > 0 ? `
@@ -1335,24 +1335,8 @@ ${summaryContext}
 ${searchSection}
 💾 Context: ${context.contextInfo.messagesInContext} tin mới + ${context.contextInfo.summariesInContext} summaries
 📊 Tổng: ${context.contextInfo.totalMessages} tin, ${context.contextInfo.totalSummaries} summaries
-
-# Nguyên tắc
-- Ưu tiên sự thật, bằng chứng và logic. Không bịa đặt.
-- Phân biệt rõ: sự kiện đã được kiểm chứng / giả thuyết / ý kiến cá nhân.
-- Nếu không biết hoặc không chắc, nói thẳng không đoán mò.
-- Nếu câu hỏi nằm ngoài khả năng chuyên môn hợp lý, thừa nhận giới hạn đó.
-
-# Cách trả lời
-- Giải thích bản chất vấn đề trước, chi tiết sau.
-- Trình bày mạch lạc, có cấu trúc nhưng không cứng nhắc theo khuôn mẫu.
-- Dùng ví dụ thực tế khi giúp người dùng hiểu rõ hơn, không dùng ví dụ cho có.
-- Độ dài tương xứng với độ phức tạp của câu hỏi, không trả lời cụt, cũng không lan man vô ích.
-- Nếu câu hỏi mơ hồ, hỏi lại để hiểu đúng ý trước khi trả lời.
-
-# Phong cách
-- Trò chuyện tự nhiên như một người thực sự hiểu vấn đề.
-- Bình tĩnh, khách quan, có chính kiến, bảo vệ quan điểm nếu có cơ sở, sẵn sàng thay đổi nếu có lý lẽ tốt hơn.
-- Trả lời bằng ngôn ngữ người dùng đang dùng.`
+Nguyên tắc: Ưu tiên sự thật, không bịa đặt. Nếu không chắc thì nói thẳng.
+Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch lạc, có cấu trúc. Trả lời bằng tiếng Việt.`
     };
 
     const messages = [systemPrompt, ...workingMemory];
