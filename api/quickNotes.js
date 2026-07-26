@@ -14,6 +14,9 @@ if (REDIS_ENABLED) {
 }
 
 const MAX_NOTES = 100;
+const INACTIVE_DAYS = 1000;
+const ACTIVITY_TTL_SECONDS = INACTIVE_DAYS * 24 * 60 * 60; // 86.400.000 giây
+
 const notesKey = (userId) => `kami:notes:${userId}`;
 
 async function getNotes(userId) {
@@ -21,6 +24,8 @@ async function getNotes(userId) {
   try {
     const data = await redis.get(notesKey(userId));
     if (!data) return [];
+    // Refresh TTL mỗi lần đọc (chứng minh user còn hoạt động)
+    await redis.expire(notesKey(userId), ACTIVITY_TTL_SECONDS);
     const arr = typeof data === 'string' ? JSON.parse(data) : data;
     return Array.isArray(arr) ? arr : [];
   } catch (e) {
@@ -31,7 +36,8 @@ async function getNotes(userId) {
 async function saveNotes(userId, list) {
   if (!redis) return false;
   try {
-    await redis.set(notesKey(userId), JSON.stringify(list));
+    // Lưu notes + tự động set TTL 1000 ngày
+    await redis.set(notesKey(userId), JSON.stringify(list), { ex: ACTIVITY_TTL_SECONDS });
     return true;
   } catch (e) {
     return false;
@@ -55,7 +61,7 @@ export default async function handler(req, res) {
 
     if (action === 'list') {
       const notes = await getNotes(userId);
-      return res.status(200).json({ success: true, notes, maxNotes: MAX_NOTES });
+      return res.status(200).json({ success: true, notes, maxNotes: MAX_NOTES, inactiveDays: INACTIVE_DAYS });
     }
 
     if (action === 'save') {
