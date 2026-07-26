@@ -14,8 +14,10 @@ if (REDIS_ENABLED) {
 }
 
 const MAX_NOTES = 100;
-const INACTIVE_DAYS = 1000;
-const ACTIVITY_TTL_SECONDS = INACTIVE_DAYS * 24 * 60 * 60; // 86.400.000 giây
+// Đồng bộ TTL với chat.js MEMORY_CONFIG.LONG_TERM_DAYS = 365
+// Tài khoản bị xóa sau 365 ngày không hoạt động → dữ liệu notes cũng tự xóa theo
+const LONG_TERM_DAYS = 365;
+const LONG_TERM_TTL = LONG_TERM_DAYS * 86400; // 31.536.000 giây
 
 const notesKey = (userId) => `kami:notes:${userId}`;
 
@@ -24,8 +26,8 @@ async function getNotes(userId) {
   try {
     const data = await redis.get(notesKey(userId));
     if (!data) return [];
-    // Refresh TTL mỗi lần đọc (chứng minh user còn hoạt động)
-    await redis.expire(notesKey(userId), ACTIVITY_TTL_SECONDS);
+    // Refresh TTL mỗi lần đọc — đồng bộ với chat.js getLongTermMemory()
+    await redis.expire(notesKey(userId), LONG_TERM_TTL);
     const arr = typeof data === 'string' ? JSON.parse(data) : data;
     return Array.isArray(arr) ? arr : [];
   } catch (e) {
@@ -36,8 +38,8 @@ async function getNotes(userId) {
 async function saveNotes(userId, list) {
   if (!redis) return false;
   try {
-    // Lưu notes + tự động set TTL 1000 ngày
-    await redis.set(notesKey(userId), JSON.stringify(list), { ex: ACTIVITY_TTL_SECONDS });
+    // Set TTL khi ghi — đồng bộ với chat.js setData/setHashData
+    await redis.set(notesKey(userId), JSON.stringify(list), { ex: LONG_TERM_TTL });
     return true;
   } catch (e) {
     return false;
@@ -61,7 +63,7 @@ export default async function handler(req, res) {
 
     if (action === 'list') {
       const notes = await getNotes(userId);
-      return res.status(200).json({ success: true, notes, maxNotes: MAX_NOTES, inactiveDays: INACTIVE_DAYS });
+      return res.status(200).json({ success: true, notes, maxNotes: MAX_NOTES, ttlDays: LONG_TERM_DAYS });
     }
 
     if (action === 'save') {
