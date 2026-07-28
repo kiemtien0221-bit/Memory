@@ -1,13 +1,5 @@
 import { Redis } from '@upstash/redis';
 
-const BOT_TOKENS = [
-  process.env.TELEGRAM_BOT_TOKEN_1 || "8744634752:AAG2IqlzjkMozWQ-sYYigs-WkViIpywI5-c",  // Kho 1 HIỀN
-  process.env.TELEGRAM_BOT_TOKEN_2 || "7889533382:AAH6O5wB1ncikuY5HXwVfpvoUykDptSbI28",  // Kho 2 THẠNH
-  process.env.TELEGRAM_BOT_TOKEN_3 || "8838080611:AAG1m1_nyL5C1rtjeImURLbEbnPGpWcPH7g",  // Kho 3 QUỐC
-  process.env.TELEGRAM_BOT_TOKEN_4 || "8678269940:AAFJoK5DY4It7L39LVOnf7aMqQAUt4ICA7o",  // Kho 4 HẠT
-  process.env.TELEGRAM_BOT_TOKEN_5 || "8898359854:AAGyIOxaMVRbIEPvUCmqQipA2PFEz2Xt1G4"   // Kho 5 AN
-];
-
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
 let redis = null;
 if (REDIS_ENABLED) {
@@ -102,6 +94,7 @@ function toPublicFile(it, ownerPrefs) {
     date: it.date,
     width: it.width || 0,
     height: it.height || 0,
+    channel: it.channel || 0,
     visibility: it.visibility || 'private',
     effectivePublic: isEffectivelyPublic(it, ownerPrefs),
     canEdit: true,
@@ -118,6 +111,7 @@ function toFeedItem(it, ownerId, ownerName) {
     date: it.date,
     width: it.width || 0,
     height: it.height || 0,
+    channel: it.channel || 0,
     ownerId,
     ownerName: ownerName || 'Ẩn danh',
   };
@@ -208,10 +202,23 @@ async function resolveTelegramFilePath(botToken, fileId) {
   return d.result.file_path;
 }
 
-// Lấy bot token theo channel (0-4), fallback bot 0 nếu channel không hợp lệ
+// 5 kho Telegram — phải khớp đúng thứ tự với mảng BOT_TOKENS/CHAT_IDS bên Java.
+// Đặt token thật vào biến môi trường Vercel: TELEGRAM_BOT_TOKEN_0..4
+const BOT_TOKENS = [
+  process.env.TELEGRAM_BOT_TOKEN_0,
+  process.env.TELEGRAM_BOT_TOKEN_1,
+  process.env.TELEGRAM_BOT_TOKEN_2,
+  process.env.TELEGRAM_BOT_TOKEN_3,
+  process.env.TELEGRAM_BOT_TOKEN_4,
+];
+
+// Chọn bot token theo "channel" (kho) mà ảnh đó đã được upload lên
 function pickBotToken(channel) {
-  const ch = Number(channel) || 0;
-  return BOT_TOKENS[Math.max(0, Math.min(ch, BOT_TOKENS.length - 1))];
+  const idx = Number(channel);
+  if (Number.isInteger(idx) && idx >= 0 && idx < BOT_TOKENS.length && BOT_TOKENS[idx]) {
+    return BOT_TOKENS[idx];
+  }
+  return BOT_TOKENS[0]; // fallback về kho 1 nếu channel không hợp lệ
 }
 
 export default async function handler(req, res) {
@@ -224,46 +231,11 @@ export default async function handler(req, res) {
   if (req.method === 'GET' && req.query.proxy === '1') {
     try {
       const fid = req.query.fid;
-      const uid = req.query.uid;
+      const channel = req.query.ch;
       if (!fid) return res.status(400).send('missing fid');
-      
-      let filePath = null;
-      let botToken = null;
-      let channelToTry = 0;
-      
-      // Nếu uid được gửi kèm, thử lấy channel từ Redis
-      if (uid) {
-        try {
-          const files = await getFiles(uid);
-          const fileObj = files.find((f) => f.file_id === fid);
-          if (fileObj && fileObj.channel !== undefined) {
-            channelToTry = Number(fileObj.channel) || 0;
-          }
-        } catch (e) {
-          console.error('Error getting file channel from Redis:', e);
-          // Fallback về thử bot 0 trước
-        }
-      }
-      
-      // Thử bot từ channel được lưu, nếu thất bại thì thử hết 5 bot
-      for (let attempt = 0; attempt < BOT_TOKENS.length; attempt++) {
-        const channel = (channelToTry + attempt) % BOT_TOKENS.length;
-        botToken = BOT_TOKENS[channel];
-        try {
-          filePath = await resolveTelegramFilePath(botToken, fid);
-          break; // Tìm thấy, thoát loop
-        } catch (e) {
-          if (attempt < BOT_TOKENS.length - 1) {
-            console.log(`getFile failed for channel ${channel}, trying next...`);
-            continue;
-          }
-          // Lần cuối cùng thất bại, ném lỗi ra ngoài
-          throw e;
-        }
-      }
-      
-      if (!filePath) return res.status(404).send('file not found in any channel');
-      
+      const botToken = pickBotToken(channel);
+      if (!botToken) return res.status(500).send('bot chưa cấu hình');
+      const filePath = await resolveTelegramFilePath(botToken, fid);
       const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
       const upstream = await fetch(fileUrl);
       if (!upstream.ok) return res.status(502).send('lỗi tải ảnh gốc');
@@ -324,10 +296,10 @@ export default async function handler(req, res) {
         name: f.name ? String(f.name).slice(0, 300) : 'Unknown',
         size: Number(f.size) || 0,
         message_id: Number(f.message_id) || 0,
-        channel: Number(f.channel) || 0,
         date: Number(f.date) || Math.floor(Date.now() / 1000),
         width: Number(f.width) || 0,
         height: Number(f.height) || 0,
+        channel: Number(f.channel) || 0,
         visibility: f.visibility === 'public' ? 'public' : 'private',
         ownerId: userId,
       }));
@@ -340,7 +312,7 @@ export default async function handler(req, res) {
 
     // ── Thêm 1 ảnh (sau khi upload xong lên Telegram) ───────────────
     if (action === 'add') {
-      const { id, file_id, name, size, message_id, channel, width, height } = body;
+      const { id, file_id, name, size, message_id, width, height, channel } = body;
       if (!id && !file_id) {
         return res.status(400).json({ success: false, error: 'Thiếu id/file_id' });
       }
@@ -363,10 +335,10 @@ export default async function handler(req, res) {
         name: name ? String(name).slice(0, 300) : 'Unknown',
         size: fsize,
         message_id: Number(message_id) || 0,
-        channel: Number(channel) || 0,
         date: Math.floor(Date.now() / 1000),
         width: Number(width) || 0,
         height: Number(height) || 0,
+        channel: Number(channel) || 0, // kho Telegram (0-4) ảnh này được upload lên
         visibility: 'private', // ảnh mới up mặc định riêng tư, user tự bật công khai
         ownerId: userId,
       };
