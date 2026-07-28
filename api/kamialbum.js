@@ -19,13 +19,28 @@ const FEED_PAGE_SIZE = 30;
 
 // ── Keys ─────────────────────────────────────────────────────────────
 const filesKey = (userId) => `kamialbum:files:${userId}`;
-const prefsKey = (userId) => `kamialbum:prefs:${userId}`;          // {sb: 'date', albumVisibility: 'private'|'public', displayName, avatar...}
-const likesKey = (fileId) => `kamialbum:likes:${fileId}`;          // Set<userId>
-const commentsKey = (fileId) => `kamialbum:comments:${fileId}`;    // List<{id,userId,text,date}>
-// Sorted set toàn cục cho feed công khai: score = date, member = `${userId}::${fileId}`
+const prefsKey = (userId) => `kamialbum:prefs:${userId}`;
+const likesKey = (fileId) => `kamialbum:likes:${fileId}`;
+const commentsKey = (fileId) => `kamialbum:comments:${fileId}`;
 const PUBLIC_FEED_KEY = 'kamialbum:publicfeed';
-// Danh sách userId đã từng có hoạt động (để dọn dẹp/thống kê nếu cần)
 const USERS_SET_KEY = 'kamialbum:users';
+
+// 5 kho Telegram — phải khớp đúng thứ tự với mảng BOT_TOKENS/CHAT_IDS bên Java.
+const BOT_TOKENS = [
+  process.env.TELEGRAM_BOT_TOKEN_0,
+  process.env.TELEGRAM_BOT_TOKEN_1,
+  process.env.TELEGRAM_BOT_TOKEN_2,
+  process.env.TELEGRAM_BOT_TOKEN_3,
+  process.env.TELEGRAM_BOT_TOKEN_4,
+];
+
+const CHAT_IDS = [
+  "-1003238882382",
+  "-1003661900869",
+  "-1003949997099",
+  "-1004465735490",
+  "-1004345704771",
+];
 
 async function getFiles(userId) {
   if (!redis) return [];
@@ -79,7 +94,6 @@ function albumIsPublic(prefs) {
   return prefs && prefs.albumVisibility === 'public';
 }
 
-// Ảnh chỉ thực sự công khai khi album public VÀ ảnh đó tự set public
 function isEffectivelyPublic(file, prefs) {
   return albumIsPublic(prefs) && file.visibility === 'public';
 }
@@ -117,7 +131,6 @@ function toFeedItem(it, ownerId, ownerName) {
   };
 }
 
-// Cập nhật sorted-set feed công khai cho 1 ảnh: thêm nếu public, gỡ nếu không
 async function syncFeedEntry(userId, file, ownerPrefs) {
   if (!redis) return;
   const member = `${userId}::${file.id}`;
@@ -132,7 +145,6 @@ async function syncFeedEntry(userId, file, ownerPrefs) {
   }
 }
 
-// Đồng bộ TOÀN BỘ ảnh của 1 user vào feed (dùng khi bật/tắt công tắc album)
 async function syncAllFeedForUser(userId, list, prefs) {
   if (!redis) return;
   try {
@@ -188,9 +200,8 @@ async function getLikeInfo(fileId, userId) {
   }
 }
 
-// Cache ngắn hạn file_path để đỡ gọi getFile lặp lại liên tục (Telegram giới hạn rate)
-const filePathCache = new Map(); // file_id -> { path, expiresAt }
-const FILE_PATH_TTL_MS = 50 * 60 * 1000; // ~50 phút (Telegram link hết hạn ~1h)
+const filePathCache = new Map();
+const FILE_PATH_TTL_MS = 50 * 60 * 1000;
 
 async function resolveTelegramFilePath(botToken, fileId) {
   const cached = filePathCache.get(fileId);
@@ -202,23 +213,28 @@ async function resolveTelegramFilePath(botToken, fileId) {
   return d.result.file_path;
 }
 
-// 5 kho Telegram — phải khớp đúng thứ tự với mảng BOT_TOKENS/CHAT_IDS bên Java.
-// Đặt token thật vào biến môi trường Vercel: TELEGRAM_BOT_TOKEN_0..4
-const BOT_TOKENS = [
-  process.env.TELEGRAM_BOT_TOKEN_0,
-  process.env.TELEGRAM_BOT_TOKEN_1,
-  process.env.TELEGRAM_BOT_TOKEN_2,
-  process.env.TELEGRAM_BOT_TOKEN_3,
-  process.env.TELEGRAM_BOT_TOKEN_4,
-];
-
-// Chọn bot token theo "channel" (kho) mà ảnh đó đã được upload lên
 function pickBotToken(channel) {
   const idx = Number(channel);
   if (Number.isInteger(idx) && idx >= 0 && idx < BOT_TOKENS.length && BOT_TOKENS[idx]) {
     return BOT_TOKENS[idx];
   }
-  return BOT_TOKENS[0]; // fallback về kho 1 nếu channel không hợp lệ
+  return BOT_TOKENS[0];
+}
+
+// ── FIX: Server-side xóa message Telegram (fire-and-forget) ───────────
+async function serverDeleteTelegram(channel, messageId) {
+  try {
+    const botToken = pickBotToken(channel);
+    if (!botToken || !messageId) return;
+    const chatId = CHAT_IDS[Number(channel)] || CHAT_IDS[0];
+    await fetch(`https://api.telegram.org/bot${botToken}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+    });
+  } catch (e) {
+    console.error('serverDeleteTelegram error:', e);
+  }
 }
 
 export default async function handler(req, res) {
@@ -227,7 +243,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // ── GET: proxy ảnh — server giữ bot token, client chỉ nhận bytes ───
+  // ── GET: proxy ảnh ───
   if (req.method === 'GET' && req.query.proxy === '1') {
     try {
       const fid = req.query.fid;
@@ -264,7 +280,6 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: 'Thiếu userId' });
     }
 
-    // ── Danh sách ảnh của chính mình (My Album) ─────────────────────
     if (action === 'list') {
       const [files, prefs] = await Promise.all([getFiles(userId), getPrefs(userId)]);
       return res.status(200).json({
@@ -277,7 +292,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── Ghi đè toàn bộ danh sách (client giữ logic thêm/xoá/sửa) ────
     if (action === 'save') {
       const { files } = body;
       if (!Array.isArray(files)) {
@@ -310,7 +324,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, count: clean.length });
     }
 
-    // ── Thêm 1 ảnh (sau khi upload xong lên Telegram) ───────────────
     if (action === 'add') {
       const { id, file_id, name, size, message_id, width, height, channel } = body;
       if (!id && !file_id) {
@@ -338,8 +351,8 @@ export default async function handler(req, res) {
         date: Math.floor(Date.now() / 1000),
         width: Number(width) || 0,
         height: Number(height) || 0,
-        channel: Number(channel) || 0, // kho Telegram (0-4) ảnh này được upload lên
-        visibility: 'private', // ảnh mới up mặc định riêng tư, user tự bật công khai
+        channel: Number(channel) || 0,
+        visibility: 'private',
         ownerId: userId,
       };
       list.unshift(item);
@@ -349,7 +362,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, file: toPublicFile(item, await getPrefs(userId)) });
     }
 
-    // ── Xoá 1 ảnh (cascade xoá like/comment + gỡ khỏi feed) ─────────
+    // ── FIX: remove — server cũng thử xóa Telegram (fire-and-forget) ──
     if (action === 'remove') {
       const { id } = body;
       if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
@@ -358,6 +371,8 @@ export default async function handler(req, res) {
       const next = list.filter((f) => f.file_id !== id && f.id !== id);
       await saveFiles(userId, next);
       if (target) {
+        // Xóa Telegram song song, không đợi
+        serverDeleteTelegram(target.channel || 0, target.message_id || 0);
         await Promise.all([
           removeFeedEntry(userId, target.id),
           cascadeDeleteFile(target.id),
@@ -366,7 +381,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // ── Đổi tên 1 ảnh ────────────────────────────────────────────────
     if (action === 'rename') {
       const { id, name } = body;
       if (!id || !name) return res.status(400).json({ success: false, error: 'Thiếu id/name' });
@@ -378,7 +392,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // ── Bật/tắt công khai TỪNG ẢNH ───────────────────────────────────
     if (action === 'togglePhotoVisibility') {
       const { id, visibility } = body;
       if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
@@ -397,7 +410,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── Bật/tắt công khai CẢ ALBUM ───────────────────────────────────
     if (action === 'toggleAlbumVisibility') {
       const { visibility } = body;
       const vis = visibility === 'public' ? 'public' : 'private';
@@ -409,17 +421,14 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, albumVisibility: vis });
     }
 
-    // ── Feed công khai (Khám phá) — mới nhất trước, phân trang ──────
     if (action === 'feedPublic') {
-      const { cursor } = body; // cursor = index bắt đầu (0 nếu load đầu)
+      const { cursor } = body;
       const start = Number(cursor) || 0;
       const end = start + FEED_PAGE_SIZE - 1;
-      // zrevrange lấy mới nhất trước (score = date)
       const members = await redis.zrange(PUBLIC_FEED_KEY, start, end, { rev: true });
       if (!members || members.length === 0) {
         return res.status(200).json({ success: true, items: [], nextCursor: null });
       }
-      // Gom theo owner để hạn chế số lần đọc Redis
       const byOwner = {};
       members.forEach((m) => {
         const idx = m.indexOf('::');
@@ -434,7 +443,7 @@ export default async function handler(req, res) {
           return { oid, list, prefs };
         })
       );
-      const fileMap = {}; // "oid::fid" -> feed item
+      const fileMap = {};
       ownerData.forEach(({ oid, list, prefs }) => {
         const name = prefs.displayName || null;
         list.forEach((f) => {
@@ -444,7 +453,6 @@ export default async function handler(req, res) {
         });
       });
       const items = members.map((m) => fileMap[m]).filter(Boolean);
-      // Đính kèm like/comment count cho mỗi ảnh
       const withStats = await Promise.all(
         items.map(async (it) => {
           const like = await getLikeInfo(it.id, userId);
@@ -456,7 +464,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, items: withStats, nextCursor });
     }
 
-    // ── Like / Unlike ─────────────────────────────────────────────────
     if (action === 'like') {
       const { id } = body;
       if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
@@ -473,7 +480,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, likeCount: info.count, liked: false });
     }
 
-    // ── Bình luận ────────────────────────────────────────────────────
     if (action === 'comment') {
       const { id, text, displayName } = body;
       if (!id || !text || !String(text).trim()) {
@@ -509,7 +515,6 @@ export default async function handler(req, res) {
       }).filter(Boolean);
       const target = list.find((c) => c.id === commentId);
       if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy bình luận' });
-      // chỉ chủ comment mới được xoá
       if (target.userId !== userId) {
         return res.status(403).json({ success: false, error: 'Không có quyền xoá bình luận này' });
       }
@@ -521,7 +526,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // ── Lưu/đọc tuỳ chọn hiển thị (view mode, sort, tên hiển thị...) ──
     if (action === 'setPref') {
       const { key, value } = body;
       if (!key) return res.status(400).json({ success: false, error: 'Thiếu key' });
