@@ -1,5 +1,13 @@
 import { Redis } from '@upstash/redis';
 
+const BOT_TOKENS = [
+  process.env.TELEGRAM_BOT_TOKEN_1 || "8744634752:AAG2IqlzjkMozWQ-sYYigs-WkViIpywI5-c",  // Kho 1 HIỀN
+  process.env.TELEGRAM_BOT_TOKEN_2 || "7889533382:AAH6O5wB1ncikuY5HXwVfpvoUykDptSbI28",  // Kho 2 THẠNH
+  process.env.TELEGRAM_BOT_TOKEN_3 || "8838080611:AAG1m1_nyL5C1rtjeImURLbEbnPGpWcPH7g",  // Kho 3 QUỐC
+  process.env.TELEGRAM_BOT_TOKEN_4 || "8678269940:AAFJoK5DY4It7L39LVOnf7aMqQAUt4ICA7o",  // Kho 4 HẠT
+  process.env.TELEGRAM_BOT_TOKEN_5 || "8898359854:AAGyIOxaMVRbIEPvUCmqQipA2PFEz2Xt1G4"   // Kho 5 AN
+];
+
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
 let redis = null;
 if (REDIS_ENABLED) {
@@ -200,12 +208,10 @@ async function resolveTelegramFilePath(botToken, fileId) {
   return d.result.file_path;
 }
 
-// Xác định bot token phù hợp cho 1 ảnh dựa trên chủ sở hữu (userId).
-// Giữ đơn giản: dùng chung 1 bot cho toàn bộ ảnh qua proxy (đủ cho MVP).
-// Nếu code gốc của bạn có nhiều bot theo "channel", thay hàm này để chọn
-// đúng BOT_TOKEN_<channel> tương ứng.
-function pickBotToken() {
-  return process.env.TELEGRAM_BOT_TOKEN;
+// Lấy bot token theo channel (0-4), fallback bot 0 nếu channel không hợp lệ
+function pickBotToken(channel) {
+  const ch = Number(channel) || 0;
+  return BOT_TOKENS[Math.max(0, Math.min(ch, BOT_TOKENS.length - 1))];
 }
 
 export default async function handler(req, res) {
@@ -218,10 +224,46 @@ export default async function handler(req, res) {
   if (req.method === 'GET' && req.query.proxy === '1') {
     try {
       const fid = req.query.fid;
+      const uid = req.query.uid;
       if (!fid) return res.status(400).send('missing fid');
-      const botToken = pickBotToken();
-      if (!botToken) return res.status(500).send('bot chưa cấu hình');
-      const filePath = await resolveTelegramFilePath(botToken, fid);
+      
+      let filePath = null;
+      let botToken = null;
+      let channelToTry = 0;
+      
+      // Nếu uid được gửi kèm, thử lấy channel từ Redis
+      if (uid) {
+        try {
+          const files = await getFiles(uid);
+          const fileObj = files.find((f) => f.file_id === fid);
+          if (fileObj && fileObj.channel !== undefined) {
+            channelToTry = Number(fileObj.channel) || 0;
+          }
+        } catch (e) {
+          console.error('Error getting file channel from Redis:', e);
+          // Fallback về thử bot 0 trước
+        }
+      }
+      
+      // Thử bot từ channel được lưu, nếu thất bại thì thử hết 5 bot
+      for (let attempt = 0; attempt < BOT_TOKENS.length; attempt++) {
+        const channel = (channelToTry + attempt) % BOT_TOKENS.length;
+        botToken = BOT_TOKENS[channel];
+        try {
+          filePath = await resolveTelegramFilePath(botToken, fid);
+          break; // Tìm thấy, thoát loop
+        } catch (e) {
+          if (attempt < BOT_TOKENS.length - 1) {
+            console.log(`getFile failed for channel ${channel}, trying next...`);
+            continue;
+          }
+          // Lần cuối cùng thất bại, ném lỗi ra ngoài
+          throw e;
+        }
+      }
+      
+      if (!filePath) return res.status(404).send('file not found in any channel');
+      
       const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
       const upstream = await fetch(fileUrl);
       if (!upstream.ok) return res.status(502).send('lỗi tải ảnh gốc');
@@ -282,6 +324,7 @@ export default async function handler(req, res) {
         name: f.name ? String(f.name).slice(0, 300) : 'Unknown',
         size: Number(f.size) || 0,
         message_id: Number(f.message_id) || 0,
+        channel: Number(f.channel) || 0,
         date: Number(f.date) || Math.floor(Date.now() / 1000),
         width: Number(f.width) || 0,
         height: Number(f.height) || 0,
@@ -297,7 +340,7 @@ export default async function handler(req, res) {
 
     // ── Thêm 1 ảnh (sau khi upload xong lên Telegram) ───────────────
     if (action === 'add') {
-      const { id, file_id, name, size, message_id, width, height } = body;
+      const { id, file_id, name, size, message_id, channel, width, height } = body;
       if (!id && !file_id) {
         return res.status(400).json({ success: false, error: 'Thiếu id/file_id' });
       }
@@ -320,6 +363,7 @@ export default async function handler(req, res) {
         name: name ? String(name).slice(0, 300) : 'Unknown',
         size: fsize,
         message_id: Number(message_id) || 0,
+        channel: Number(channel) || 0,
         date: Math.floor(Date.now() / 1000),
         width: Number(width) || 0,
         height: Number(height) || 0,
