@@ -15,11 +15,15 @@ if (REDIS_ENABLED) {
 
 const QUOTA_BYTES = 100 * 1024 * 1024 * 1024; // 100GB
 const MAX_FILES = 5000;
+const MAX_ALBUMS = 200;
 const FEED_PAGE_SIZE = 30;
+const DEFAULT_ALBUM_ID = 'default';
+const DEFAULT_ALBUM_NAME = 'Album chung';
 
 // ── Keys ─────────────────────────────────────────────────────────────
 const filesKey = (userId) => `kamialbum:files:${userId}`;
 const prefsKey = (userId) => `kamialbum:prefs:${userId}`;
+const albumsKey = (userId) => `kamialbum:albums:${userId}`;
 const likesKey = (fileId) => `kamialbum:likes:${fileId}`;
 const commentsKey = (fileId) => `kamialbum:comments:${fileId}`;
 const PUBLIC_FEED_KEY = 'kamialbum:publicfeed';
@@ -90,15 +94,70 @@ async function savePrefs(userId, prefs) {
   }
 }
 
-function albumIsPublic(prefs) {
-  return prefs && prefs.albumVisibility === 'public';
+async function getAlbums(userId) {
+  if (!redis) return [];
+  try {
+    const data = await redis.get(albumsKey(userId));
+    if (!data) return [];
+    const arr = typeof data === 'string' ? JSON.parse(data) : data;
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    console.error('getAlbums error:', e);
+    return [];
+  }
 }
 
-function isEffectivelyPublic(file, prefs) {
-  return albumIsPublic(prefs) && file.visibility === 'public';
+async function saveAlbums(userId, list) {
+  if (!redis) return false;
+  try {
+    await redis.set(albumsKey(userId), JSON.stringify(list));
+    return true;
+  } catch (e) {
+    console.error('saveAlbums error:', e);
+    return false;
+  }
 }
 
-function toPublicFile(it, ownerPrefs) {
+function makeDefaultAlbum() {
+  return { id: DEFAULT_ALBUM_ID, name: DEFAULT_ALBUM_NAME, visibility: 'private', createdAt: 0, isDefault: true };
+}
+
+// Đảm bảo luôn có "Album chung" trong danh sách album, kể cả với user cũ chưa có record album nào.
+async function ensureDefaultAlbum(userId, albums) {
+  let list = albums;
+  let changed = false;
+  if (!Array.isArray(list)) { list = []; changed = true; }
+  if (!list.some((a) => a.id === DEFAULT_ALBUM_ID)) {
+    list = [makeDefaultAlbum(), ...list];
+    changed = true;
+  }
+  if (changed) await saveAlbums(userId, list);
+  return list;
+}
+
+function albumMap(albums) {
+  const m = {};
+  albums.forEach((a) => { m[a.id] = a; });
+  if (!m[DEFAULT_ALBUM_ID]) m[DEFAULT_ALBUM_ID] = makeDefaultAlbum();
+  return m;
+}
+
+function fileAlbumId(file) {
+  return file.albumId || DEFAULT_ALBUM_ID;
+}
+
+function albumIsPublic(album) {
+  return !!album && album.visibility === 'public';
+}
+
+// Ảnh public thật sự khi: bản thân ảnh đặt public VÀ album chứa nó cũng public.
+function isEffectivelyPublic(file, albumsById) {
+  const album = albumsById[fileAlbumId(file)];
+  return albumIsPublic(album) && file.visibility === 'public';
+}
+
+function toPublicFile(it, albumsById) {
+  const album = albumsById[fileAlbumId(it)];
   return {
     id: it.id,
     file_id: it.file_id,
@@ -110,12 +169,15 @@ function toPublicFile(it, ownerPrefs) {
     height: it.height || 0,
     channel: it.channel || 0,
     visibility: it.visibility || 'private',
-    effectivePublic: isEffectivelyPublic(it, ownerPrefs),
+    albumId: fileAlbumId(it),
+    albumName: album ? album.name : DEFAULT_ALBUM_NAME,
+    effectivePublic: isEffectivelyPublic(it, albumsById),
     canEdit: true,
   };
 }
 
-function toFeedItem(it, ownerId, ownerName) {
+function toFeedItem(it, ownerId, ownerName, albumsById) {
+  const album = albumsById[fileAlbumId(it)];
   return {
     id: it.id,
     file_id: it.file_id,
@@ -128,14 +190,16 @@ function toFeedItem(it, ownerId, ownerName) {
     channel: it.channel || 0,
     ownerId,
     ownerName: ownerName || 'Ẩn danh',
+    albumId: fileAlbumId(it),
+    albumName: album ? album.name : DEFAULT_ALBUM_NAME,
   };
 }
 
-async function syncFeedEntry(userId, file, ownerPrefs) {
+async function syncFeedEntry(userId, file, albumsById) {
   if (!redis) return;
   const member = `${userId}::${file.id}`;
   try {
-    if (isEffectivelyPublic(file, ownerPrefs)) {
+    if (isEffectivelyPublic(file, albumsById)) {
       await redis.zadd(PUBLIC_FEED_KEY, { score: Number(file.date) || 0, member });
     } else {
       await redis.zrem(PUBLIC_FEED_KEY, member);
@@ -145,11 +209,11 @@ async function syncFeedEntry(userId, file, ownerPrefs) {
   }
 }
 
-async function syncAllFeedForUser(userId, list, prefs) {
+async function syncAllFeedForUser(userId, list, albumsById) {
   if (!redis) return;
   try {
-    const pub = list.filter((f) => isEffectivelyPublic(f, prefs));
-    const priv = list.filter((f) => !isEffectivelyPublic(f, prefs));
+    const pub = list.filter((f) => isEffectivelyPublic(f, albumsById));
+    const priv = list.filter((f) => !isEffectivelyPublic(f, albumsById));
     const ops = [];
     if (pub.length) {
       const members = {};
@@ -281,12 +345,16 @@ export default async function handler(req, res) {
     }
 
     if (action === 'list') {
-      const [files, prefs] = await Promise.all([getFiles(userId), getPrefs(userId)]);
+      const [files, prefs, albumsRaw] = await Promise.all([getFiles(userId), getPrefs(userId), getAlbums(userId)]);
+      const albums = await ensureDefaultAlbum(userId, albumsRaw);
+      const albumsById = albumMap(albums);
+      const { albumId } = body;
+      const filtered = albumId ? files.filter((f) => fileAlbumId(f) === albumId) : files;
       return res.status(200).json({
         success: true,
-        files: files.map((f) => toPublicFile(f, prefs)),
+        files: filtered.map((f) => toPublicFile(f, albumsById)),
+        albums,
         prefs,
-        albumVisibility: prefs.albumVisibility || 'private',
         quota: QUOTA_BYTES,
         maxFiles: MAX_FILES,
       });
@@ -315,17 +383,18 @@ export default async function handler(req, res) {
         height: Number(f.height) || 0,
         channel: Number(f.channel) || 0,
         visibility: f.visibility === 'public' ? 'public' : 'private',
+        albumId: f.albumId ? String(f.albumId).slice(0, 100) : DEFAULT_ALBUM_ID,
         ownerId: userId,
       }));
       const ok = await saveFiles(userId, clean);
       if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
-      const prefs = await getPrefs(userId);
-      await syncAllFeedForUser(userId, clean, prefs);
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      await syncAllFeedForUser(userId, clean, albumMap(albums));
       return res.status(200).json({ success: true, count: clean.length });
     }
 
     if (action === 'add') {
-      const { id, file_id, name, size, message_id, width, height, channel } = body;
+      const { id, file_id, name, size, message_id, width, height, channel, albumId } = body;
       if (!id && !file_id) {
         return res.status(400).json({ success: false, error: 'Thiếu id/file_id' });
       }
@@ -342,6 +411,9 @@ export default async function handler(req, res) {
       if (totalSize + fsize > QUOTA_BYTES) {
         return res.status(400).json({ success: false, error: 'Vượt quá quota 100GB' });
       }
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const albumsById = albumMap(albums);
+      const targetAlbumId = albumId && albumsById[albumId] ? String(albumId) : DEFAULT_ALBUM_ID;
       const item = {
         id: fid,
         file_id: fid,
@@ -353,13 +425,14 @@ export default async function handler(req, res) {
         height: Number(height) || 0,
         channel: Number(channel) || 0,
         visibility: 'private',
+        albumId: targetAlbumId,
         ownerId: userId,
       };
       list.unshift(item);
       const ok = await saveFiles(userId, list);
       if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
       await redis.sadd(USERS_SET_KEY, userId);
-      return res.status(200).json({ success: true, file: toPublicFile(item, await getPrefs(userId)) });
+      return res.status(200).json({ success: true, file: toPublicFile(item, albumsById) });
     }
 
     // ── FIX: remove — server cũng thử xóa Telegram (fire-and-forget) ──
@@ -401,24 +474,159 @@ export default async function handler(req, res) {
       if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy ảnh' });
       target.visibility = vis;
       await saveFiles(userId, list);
-      const prefs = await getPrefs(userId);
-      await syncFeedEntry(userId, target, prefs);
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const albumsById = albumMap(albums);
+      await syncFeedEntry(userId, target, albumsById);
       return res.status(200).json({
         success: true,
         visibility: vis,
-        effectivePublic: isEffectivelyPublic(target, prefs),
+        effectivePublic: isEffectivelyPublic(target, albumsById),
       });
     }
 
+    // ── Album: danh sách ─────────────────────────────────────────────
+    if (action === 'listAlbums') {
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const files = await getFiles(userId);
+      const counts = {};
+      files.forEach((f) => { const aid = fileAlbumId(f); counts[aid] = (counts[aid] || 0) + 1; });
+      return res.status(200).json({
+        success: true,
+        albums: albums.map((a) => ({ ...a, count: counts[a.id] || 0 })),
+      });
+    }
+
+    // ── Album: tạo mới ───────────────────────────────────────────────
+    if (action === 'createAlbum') {
+      const { name } = body;
+      const cleanName = name ? String(name).trim().slice(0, 100) : '';
+      if (!cleanName) return res.status(400).json({ success: false, error: 'Thiếu tên album' });
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      if (albums.length >= MAX_ALBUMS) {
+        return res.status(400).json({ success: false, error: 'Đã đạt giới hạn ' + MAX_ALBUMS + ' album' });
+      }
+      const newAlbum = {
+        id: `alb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: cleanName,
+        visibility: 'private',
+        createdAt: Math.floor(Date.now() / 1000),
+        isDefault: false,
+      };
+      albums.push(newAlbum);
+      const ok = await saveAlbums(userId, albums);
+      if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
+      return res.status(200).json({ success: true, album: newAlbum });
+    }
+
+    // ── Album: đổi tên ───────────────────────────────────────────────
+    if (action === 'renameAlbum') {
+      const { albumId, name } = body;
+      const cleanName = name ? String(name).trim().slice(0, 100) : '';
+      if (!albumId || !cleanName) return res.status(400).json({ success: false, error: 'Thiếu albumId/name' });
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const target = albums.find((a) => a.id === albumId);
+      if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy album' });
+      target.name = cleanName;
+      await saveAlbums(userId, albums);
+      return res.status(200).json({ success: true });
+    }
+
+    // ── Album: xóa (ảnh trong album chuyển về Album chung) ───────────
+    if (action === 'deleteAlbum') {
+      const { albumId } = body;
+      if (!albumId) return res.status(400).json({ success: false, error: 'Thiếu albumId' });
+      if (albumId === DEFAULT_ALBUM_ID) {
+        return res.status(400).json({ success: false, error: 'Không thể xóa Album chung' });
+      }
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const nextAlbums = albums.filter((a) => a.id !== albumId);
+      await saveAlbums(userId, nextAlbums);
+      const files = await getFiles(userId);
+      let touched = false;
+      files.forEach((f) => {
+        if (fileAlbumId(f) === albumId) { f.albumId = DEFAULT_ALBUM_ID; touched = true; }
+      });
+      if (touched) {
+        await saveFiles(userId, files);
+        await syncAllFeedForUser(userId, files, albumMap(nextAlbums));
+      }
+      return res.status(200).json({ success: true });
+    }
+
+    // ── Album: bật/tắt công khai cho 1 album ─────────────────────────
     if (action === 'toggleAlbumVisibility') {
-      const { visibility } = body;
+      const { albumId, visibility } = body;
+      const targetId = albumId || DEFAULT_ALBUM_ID;
       const vis = visibility === 'public' ? 'public' : 'private';
-      const prefs = await getPrefs(userId);
-      prefs.albumVisibility = vis;
-      await savePrefs(userId, prefs);
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const target = albums.find((a) => a.id === targetId);
+      if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy album' });
+      target.visibility = vis;
+      await saveAlbums(userId, albums);
+      const files = await getFiles(userId);
+      const albumFiles = files.filter((f) => fileAlbumId(f) === targetId);
+      await syncAllFeedForUser(userId, albumFiles, albumMap(albums));
+      return res.status(200).json({ success: true, albumId: targetId, visibility: vis });
+    }
+
+    // ── Hàng loạt: di chuyển ảnh sang album khác ─────────────────────
+    if (action === 'bulkMove') {
+      const { ids, albumId } = body;
+      if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      const albumsById = albumMap(albums);
+      const targetAlbumId = albumId && albumsById[albumId] ? String(albumId) : DEFAULT_ALBUM_ID;
+      const idSet = new Set(ids.map(String));
       const list = await getFiles(userId);
-      await syncAllFeedForUser(userId, list, prefs);
-      return res.status(200).json({ success: true, albumVisibility: vis });
+      const moved = [];
+      list.forEach((f) => {
+        if (idSet.has(String(f.file_id)) || idSet.has(String(f.id))) {
+          f.albumId = targetAlbumId;
+          moved.push(f);
+        }
+      });
+      await saveFiles(userId, list);
+      await syncAllFeedForUser(userId, moved, albumsById);
+      return res.status(200).json({ success: true, count: moved.length, albumId: targetAlbumId });
+    }
+
+    // ── Hàng loạt: đổi công khai/riêng tư nhiều ảnh cùng lúc ─────────
+    if (action === 'bulkSetVisibility') {
+      const { ids, visibility } = body;
+      if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
+      const vis = visibility === 'public' ? 'public' : 'private';
+      const idSet = new Set(ids.map(String));
+      const list = await getFiles(userId);
+      const touched = [];
+      list.forEach((f) => {
+        if (idSet.has(String(f.file_id)) || idSet.has(String(f.id))) {
+          f.visibility = vis;
+          touched.push(f);
+        }
+      });
+      await saveFiles(userId, list);
+      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
+      await syncAllFeedForUser(userId, touched, albumMap(albums));
+      return res.status(200).json({ success: true, count: touched.length, visibility: vis });
+    }
+
+    // ── Hàng loạt: xóa nhiều ảnh (server cũng dọn Telegram, comment, like) ──
+    if (action === 'bulkDelete') {
+      const { ids } = body;
+      if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
+      const idSet = new Set(ids.map(String));
+      const list = await getFiles(userId);
+      const targets = list.filter((f) => idSet.has(String(f.file_id)) || idSet.has(String(f.id)));
+      const next = list.filter((f) => !idSet.has(String(f.file_id)) && !idSet.has(String(f.id)));
+      await saveFiles(userId, next);
+      await Promise.all(targets.map(async (target) => {
+        serverDeleteTelegram(target.channel || 0, target.message_id || 0);
+        await Promise.all([
+          removeFeedEntry(userId, target.id),
+          cascadeDeleteFile(target.id),
+        ]);
+      }));
+      return res.status(200).json({ success: true, count: targets.length });
     }
 
     if (action === 'feedPublic') {
@@ -439,16 +647,17 @@ export default async function handler(req, res) {
       const ownerIds = Object.keys(byOwner);
       const ownerData = await Promise.all(
         ownerIds.map(async (oid) => {
-          const [list, prefs] = await Promise.all([getFiles(oid), getPrefs(oid)]);
-          return { oid, list, prefs };
+          const [list, prefs, albumsRaw] = await Promise.all([getFiles(oid), getPrefs(oid), getAlbums(oid)]);
+          const albums = await ensureDefaultAlbum(oid, albumsRaw);
+          return { oid, list, prefs, albumsById: albumMap(albums) };
         })
       );
       const fileMap = {};
-      ownerData.forEach(({ oid, list, prefs }) => {
+      ownerData.forEach(({ oid, list, prefs, albumsById }) => {
         const name = prefs.displayName || null;
         list.forEach((f) => {
-          if (isEffectivelyPublic(f, prefs)) {
-            fileMap[`${oid}::${f.id}`] = toFeedItem(f, oid, name);
+          if (isEffectivelyPublic(f, albumsById)) {
+            fileMap[`${oid}::${f.id}`] = toFeedItem(f, oid, name, albumsById);
           }
         });
       });
@@ -462,6 +671,32 @@ export default async function handler(req, res) {
       );
       const nextCursor = members.length < FEED_PAGE_SIZE ? null : end + 1;
       return res.status(200).json({ success: true, items: withStats, nextCursor });
+    }
+
+    // ── Xem toàn bộ 1 album công khai (từ tab Khám phá, click vào tên album) ──
+    if (action === 'feedAlbum') {
+      const { ownerId, albumId } = body;
+      if (!ownerId || !albumId) return res.status(400).json({ success: false, error: 'Thiếu ownerId/albumId' });
+      const [list, prefs, albumsRaw] = await Promise.all([getFiles(ownerId), getPrefs(ownerId), getAlbums(ownerId)]);
+      const albums = await ensureDefaultAlbum(ownerId, albumsRaw);
+      const albumsById = albumMap(albums);
+      const album = albumsById[albumId];
+      if (!album || album.visibility !== 'public') {
+        return res.status(200).json({ success: true, items: [], album: null });
+      }
+      const name = prefs.displayName || null;
+      const items = list
+        .filter((f) => fileAlbumId(f) === albumId && isEffectivelyPublic(f, albumsById))
+        .map((f) => toFeedItem(f, ownerId, name, albumsById))
+        .sort((a, b) => (b.date || 0) - (a.date || 0));
+      const withStats = await Promise.all(
+        items.map(async (it) => {
+          const like = await getLikeInfo(it.id, userId);
+          const commentCount = await redis.llen(commentsKey(it.id)).catch(() => 0);
+          return { ...it, likeCount: like.count, liked: like.liked, commentCount: Number(commentCount) || 0 };
+        })
+      );
+      return res.status(200).json({ success: true, items: withStats, album: { id: album.id, name: album.name } });
     }
 
     if (action === 'like') {
