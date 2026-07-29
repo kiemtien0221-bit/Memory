@@ -394,7 +394,7 @@ export default async function handler(req, res) {
     }
 
     if (action === 'add') {
-      const { id, file_id, name, size, message_id, width, height, channel, albumId } = body;
+      const { id, file_id, name, size, message_id, width, height, channel, albumId, displayName } = body;
       if (!id && !file_id) {
         return res.status(400).json({ success: false, error: 'Thiếu id/file_id' });
       }
@@ -432,6 +432,12 @@ export default async function handler(req, res) {
       const ok = await saveFiles(userId, list);
       if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
       await redis.sadd(USERS_SET_KEY, userId);
+      if (displayName && String(displayName).trim()) {
+        const curPrefs = await getPrefs(userId);
+        if (curPrefs.displayName !== displayName) {
+          await savePrefs(userId, { ...curPrefs, displayName: String(displayName).slice(0, 100) });
+        }
+      }
       return res.status(200).json({ success: true, file: toPublicFile(item, albumsById) });
     }
 
