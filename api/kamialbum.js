@@ -505,7 +505,7 @@ export default async function handler(req, res) {
     // ── Album: tạo mới ───────────────────────────────────────────────
     if (action === 'createAlbum') {
       const { name } = body;
-      const cleanName = name ? String(name).trim().slice(0, 100) : '';
+      const cleanName = name ? String(name).trim().slice(0, 30) : '';
       if (!cleanName) return res.status(400).json({ success: false, error: 'Thiếu tên album' });
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       if (albums.length >= MAX_ALBUMS) {
@@ -527,7 +527,7 @@ export default async function handler(req, res) {
     // ── Album: đổi tên ───────────────────────────────────────────────
     if (action === 'renameAlbum') {
       const { albumId, name } = body;
-      const cleanName = name ? String(name).trim().slice(0, 100) : '';
+      const cleanName = name ? String(name).trim().slice(0, 30) : '';
       if (!albumId || !cleanName) return res.status(400).json({ success: false, error: 'Thiếu albumId/name' });
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const target = albums.find((a) => a.id === albumId);
