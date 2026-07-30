@@ -122,7 +122,6 @@ function makeDefaultAlbum() {
   return { id: DEFAULT_ALBUM_ID, name: DEFAULT_ALBUM_NAME, visibility: 'private', createdAt: 0, isDefault: true };
 }
 
-// Đảm bảo luôn có "Album chung" trong danh sách album, kể cả với user cũ chưa có record album nào.
 async function ensureDefaultAlbum(userId, albums) {
   let list = albums;
   let changed = false;
@@ -150,10 +149,10 @@ function albumIsPublic(album) {
   return !!album && album.visibility === 'public';
 }
 
-// Ảnh public thật sự khi: bản thân ảnh đặt public VÀ album chứa nó cũng public.
+// Ảnh public khi album chứa nó public (không còn visibility ở file level)
 function isEffectivelyPublic(file, albumsById) {
   const album = albumsById[fileAlbumId(file)];
-  return albumIsPublic(album) && file.visibility === 'public';
+  return albumIsPublic(album);
 }
 
 function toPublicFile(it, albumsById) {
@@ -168,7 +167,6 @@ function toPublicFile(it, albumsById) {
     width: it.width || 0,
     height: it.height || 0,
     channel: it.channel || 0,
-    visibility: it.visibility || 'private',
     albumId: fileAlbumId(it),
     albumName: album ? album.name : DEFAULT_ALBUM_NAME,
     effectivePublic: isEffectivelyPublic(it, albumsById),
@@ -286,7 +284,6 @@ function pickBotToken(channel) {
   return BOT_TOKENS[0];
 }
 
-// ── FIX: Server-side xóa message Telegram (fire-and-forget) ───────────
 async function serverDeleteTelegram(channel, messageId) {
   try {
     const botToken = pickBotToken(channel);
@@ -308,7 +305,6 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // ── GET: proxy ảnh ───
   if (req.method === 'GET' && req.query.proxy === '1') {
     try {
       const fid = req.query.fid;
@@ -373,6 +369,7 @@ export default async function handler(req, res) {
       if (totalSize > QUOTA_BYTES) {
         return res.status(400).json({ success: false, error: 'Vượt quá quota 100GB' });
       }
+      // Bỏ visibility ở file level, chỉ giữ albumId
       const clean = files.map((f) => ({
         id: f.id,
         file_id: f.file_id || f.id,
@@ -383,7 +380,6 @@ export default async function handler(req, res) {
         width: Number(f.width) || 0,
         height: Number(f.height) || 0,
         channel: Number(f.channel) || 0,
-        visibility: f.visibility === 'public' ? 'public' : 'private',
         albumId: f.albumId ? String(f.albumId).slice(0, 100) : DEFAULT_ALBUM_ID,
         ownerId: userId,
       }));
@@ -425,7 +421,6 @@ export default async function handler(req, res) {
         width: Number(width) || 0,
         height: Number(height) || 0,
         channel: Number(channel) || 0,
-        visibility: 'private',
         albumId: targetAlbumId,
         ownerId: userId,
       };
@@ -443,7 +438,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, file: toPublicFile(item, albumsById) });
     }
 
-    // ── FIX: remove — server cũng thử xóa Telegram (fire-and-forget) ──
     if (action === 'remove') {
       const { id } = body;
       if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
@@ -452,7 +446,6 @@ export default async function handler(req, res) {
       const next = list.filter((f) => f.file_id !== id && f.id !== id);
       await saveFiles(userId, next);
       if (target) {
-        // Xóa Telegram song song, không đợi
         serverDeleteTelegram(target.channel || 0, target.message_id || 0);
         await Promise.all([
           removeFeedEntry(userId, target.id),
@@ -473,27 +466,8 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    if (action === 'togglePhotoVisibility') {
-      const { id, visibility } = body;
-      if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
-      const vis = visibility === 'public' ? 'public' : 'private';
-      const list = await getFiles(userId);
-      const target = list.find((f) => f.file_id === id || f.id === id);
-      if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy ảnh' });
-      target.visibility = vis;
-      if (vis === 'public') target.publicAt = Math.floor(Date.now() / 1000);
-      await saveFiles(userId, list);
-      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
-      const albumsById = albumMap(albums);
-      await syncFeedEntry(userId, target, albumsById);
-      return res.status(200).json({
-        success: true,
-        visibility: vis,
-        effectivePublic: isEffectivelyPublic(target, albumsById),
-      });
-    }
+    // Bỏ togglePhotoVisibility - không còn visibility ở file level
 
-    // ── Album: danh sách ─────────────────────────────────────────────
     if (action === 'listAlbums') {
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const files = await getFiles(userId);
@@ -505,7 +479,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── Album: tạo mới ───────────────────────────────────────────────
     if (action === 'createAlbum') {
       const { name } = body;
       const cleanName = name ? String(name).trim().slice(0, 30) : '';
@@ -527,7 +500,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, album: newAlbum });
     }
 
-    // ── Album: đổi tên ───────────────────────────────────────────────
     if (action === 'renameAlbum') {
       const { albumId, name } = body;
       const cleanName = name ? String(name).trim().slice(0, 30) : '';
@@ -540,7 +512,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // ── Album: xóa (ảnh trong album chuyển về Album chung) ───────────
     if (action === 'deleteAlbum') {
       const { albumId } = body;
       if (!albumId) return res.status(400).json({ success: false, error: 'Thiếu albumId' });
@@ -562,7 +533,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // ── Album: bật/tắt công khai cho 1 album ─────────────────────────
+    // FIX BUG: toggleAlbumVisibility - khi bật lại phải set publicAt cho TẤT CẢ ảnh trong album
     if (action === 'toggleAlbumVisibility') {
       const { albumId, visibility } = body;
       const targetId = albumId || DEFAULT_ALBUM_ID;
@@ -574,16 +545,19 @@ export default async function handler(req, res) {
       await saveAlbums(userId, albums);
       const files = await getFiles(userId);
       const albumFiles = files.filter((f) => fileAlbumId(f) === targetId);
+      
+      // FIX: Khi bật public, set publicAt cho TẤT CẢ ảnh trong album (không check visibility cũ)
       if (vis === 'public') {
         const now = Math.floor(Date.now() / 1000);
-        albumFiles.forEach((f) => { if (f.visibility === 'public') f.publicAt = now; });
+        albumFiles.forEach((f) => { f.publicAt = now; });
         await saveFiles(userId, files);
       }
+      
+      // Sync feed: nếu public thì thêm vào feed, nếu private thì xóa khỏi feed
       await syncAllFeedForUser(userId, albumFiles, albumMap(albums));
       return res.status(200).json({ success: true, albumId: targetId, visibility: vis });
     }
 
-    // ── Hàng loạt: di chuyển ảnh sang album khác ─────────────────────
     if (action === 'bulkMove') {
       const { ids, albumId } = body;
       if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
@@ -604,29 +578,8 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, count: moved.length, albumId: targetAlbumId });
     }
 
-    // ── Hàng loạt: đổi công khai/riêng tư nhiều ảnh cùng lúc ─────────
-    if (action === 'bulkSetVisibility') {
-      const { ids, visibility } = body;
-      if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
-      const vis = visibility === 'public' ? 'public' : 'private';
-      const idSet = new Set(ids.map(String));
-      const list = await getFiles(userId);
-      const touched = [];
-      const now = Math.floor(Date.now() / 1000);
-      list.forEach((f) => {
-        if (idSet.has(String(f.file_id)) || idSet.has(String(f.id))) {
-          f.visibility = vis;
-          if (vis === 'public') f.publicAt = now;
-          touched.push(f);
-        }
-      });
-      await saveFiles(userId, list);
-      const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
-      await syncAllFeedForUser(userId, touched, albumMap(albums));
-      return res.status(200).json({ success: true, count: touched.length, visibility: vis });
-    }
+    // Bỏ bulkSetVisibility - không còn visibility ở file level
 
-    // ── Hàng loạt: xóa nhiều ảnh (server cũng dọn Telegram, comment, like) ──
     if (action === 'bulkDelete') {
       const { ids } = body;
       if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ success: false, error: 'Thiếu ids' });
@@ -690,7 +643,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true, items: withStats, nextCursor, total });
     }
 
-    // ── Xem toàn bộ 1 album công khai (từ tab Khám phá, click vào tên album) ──
     if (action === 'feedAlbum') {
       const { ownerId, albumId } = body;
       if (!ownerId || !albumId) return res.status(400).json({ success: false, error: 'Thiếu ownerId/albumId' });
