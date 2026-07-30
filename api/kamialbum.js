@@ -193,12 +193,14 @@ function toFeedItem(it, ownerId, ownerName, albumsById) {
   };
 }
 
+// ── FIX #1: syncFeedEntry dùng đúng cú pháp Upstash Redis zadd ─────
 async function syncFeedEntry(userId, file, albumsById) {
   if (!redis) return;
   const member = `${userId}::${file.id}`;
   try {
     if (isEffectivelyPublic(file, albumsById)) {
       const score = Number(file.publicAt) || Number(file.date) || Date.now() / 1000;
+      // ✅ ĐÚNG: dùng object { score, member }
       await redis.zadd(PUBLIC_FEED_KEY, { score, member });
     } else {
       await redis.zrem(PUBLIC_FEED_KEY, member);
@@ -208,20 +210,28 @@ async function syncFeedEntry(userId, file, albumsById) {
   }
 }
 
+// ── FIX #2: syncAllFeedForUser dùng đúng cú pháp array of objects ──
 async function syncAllFeedForUser(userId, list, albumsById) {
   if (!redis) return;
   try {
     const pub = list.filter((f) => isEffectivelyPublic(f, albumsById));
     const priv = list.filter((f) => !isEffectivelyPublic(f, albumsById));
     const ops = [];
+
     if (pub.length) {
-      const members = {};
-      pub.forEach((f) => { members[`${userId}::${f.id}`] = Number(f.publicAt) || Number(f.date) || Date.now() / 1000; });
+      // ✅ ĐÚNG: array of { score, member }
+      const members = pub.map((f) => ({
+        score: Number(f.publicAt) || Number(f.date) || Date.now() / 1000,
+        member: `${userId}::${f.id}`,
+      }));
       ops.push(redis.zadd(PUBLIC_FEED_KEY, members));
     }
+
     if (priv.length) {
-      ops.push(redis.zrem(PUBLIC_FEED_KEY, ...priv.map((f) => `${userId}::${f.id}`)));
+      // ✅ ĐÚNG: zrem nhận array members
+      ops.push(redis.zrem(PUBLIC_FEED_KEY, priv.map((f) => `${userId}::${f.id}`)));
     }
+
     await Promise.all(ops);
   } catch (e) {
     console.error('syncAllFeedForUser error:', e);
@@ -411,19 +421,26 @@ export default async function handler(req, res) {
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const albumsById = albumMap(albums);
       const targetAlbumId = albumId && albumsById[albumId] ? String(albumId) : DEFAULT_ALBUM_ID;
+
+      // ── FIX #4: Nếu album đang public, set publicAt ngay ────────────
+      const album = albumsById[targetAlbumId];
+      const now = Math.floor(Date.now() / 1000);
+
       const item = {
         id: fid,
         file_id: fid,
         name: name ? String(name).slice(0, 300) : 'Unknown',
         size: fsize,
         message_id: Number(message_id) || 0,
-        date: Math.floor(Date.now() / 1000),
+        date: now,
         width: Number(width) || 0,
         height: Number(height) || 0,
         channel: Number(channel) || 0,
         albumId: targetAlbumId,
         ownerId: userId,
+        publicAt: albumIsPublic(album) ? now : undefined,
       };
+
       list.unshift(item);
       const ok = await saveFiles(userId, list);
       if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
@@ -533,7 +550,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ success: true });
     }
 
-    // FIX BUG: toggleAlbumVisibility - khi bật lại phải set publicAt cho TẤT CẢ ảnh trong album
+    // ── FIX #3: toggleAlbumVisibility sync TẤT CẢ files của user ─────
     if (action === 'toggleAlbumVisibility') {
       const { albumId, visibility } = body;
       const targetId = albumId || DEFAULT_ALBUM_ID;
@@ -541,20 +558,24 @@ export default async function handler(req, res) {
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const target = albums.find((a) => a.id === targetId);
       if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy album' });
+
       target.visibility = vis;
       await saveAlbums(userId, albums);
       const files = await getFiles(userId);
-      const albumFiles = files.filter((f) => fileAlbumId(f) === targetId);
-      
-      // FIX: Khi bật public, set publicAt cho TẤT CẢ ảnh trong album (không check visibility cũ)
+
+      // Khi bật public, set publicAt cho TẤT CẢ ảnh trong album
       if (vis === 'public') {
         const now = Math.floor(Date.now() / 1000);
-        albumFiles.forEach((f) => { f.publicAt = now; });
+        files.forEach((f) => { 
+          if (fileAlbumId(f) === targetId) {
+            f.publicAt = now; 
+          }
+        });
         await saveFiles(userId, files);
       }
-      
-      // Sync feed: nếu public thì thêm vào feed, nếu private thì xóa khỏi feed
-      await syncAllFeedForUser(userId, albumFiles, albumMap(albums));
+
+      // ✅ Sync TẤT CẢ files của user (không chỉ albumFiles)
+      await syncAllFeedForUser(userId, files, albumMap(albums));
       return res.status(200).json({ success: true, albumId: targetId, visibility: vis });
     }
 
