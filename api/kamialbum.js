@@ -16,7 +16,7 @@ if (REDIS_ENABLED) {
 const QUOTA_BYTES = 100 * 1024 * 1024 * 1024; // 100GB
 const MAX_FILES = 5000;
 const MAX_ALBUMS = 200;
-const FEED_PAGE_SIZE = 30;
+const FEED_PAGE_SIZE = 50;
 const DEFAULT_ALBUM_ID = 'default';
 const DEFAULT_ALBUM_NAME = 'Album chung';
 
@@ -200,7 +200,8 @@ async function syncFeedEntry(userId, file, albumsById) {
   const member = `${userId}::${file.id}`;
   try {
     if (isEffectivelyPublic(file, albumsById)) {
-      await redis.zadd(PUBLIC_FEED_KEY, { score: Number(file.date) || 0, member });
+      const score = Number(file.publicAt) || Number(file.date) || Date.now() / 1000;
+      await redis.zadd(PUBLIC_FEED_KEY, { score, member });
     } else {
       await redis.zrem(PUBLIC_FEED_KEY, member);
     }
@@ -217,7 +218,7 @@ async function syncAllFeedForUser(userId, list, albumsById) {
     const ops = [];
     if (pub.length) {
       const members = {};
-      pub.forEach((f) => { members[`${userId}::${f.id}`] = Number(f.date) || 0; });
+      pub.forEach((f) => { members[`${userId}::${f.id}`] = Number(f.publicAt) || Number(f.date) || Date.now() / 1000; });
       ops.push(redis.zadd(PUBLIC_FEED_KEY, members));
     }
     if (priv.length) {
@@ -432,6 +433,7 @@ export default async function handler(req, res) {
       const ok = await saveFiles(userId, list);
       if (!ok) return res.status(500).json({ success: false, error: 'Lưu thất bại' });
       await redis.sadd(USERS_SET_KEY, userId);
+      await syncFeedEntry(userId, item, albumsById);
       if (displayName && String(displayName).trim()) {
         const curPrefs = await getPrefs(userId);
         if (curPrefs.displayName !== displayName) {
@@ -479,6 +481,7 @@ export default async function handler(req, res) {
       const target = list.find((f) => f.file_id === id || f.id === id);
       if (!target) return res.status(404).json({ success: false, error: 'Không tìm thấy ảnh' });
       target.visibility = vis;
+      if (vis === 'public') target.publicAt = Math.floor(Date.now() / 1000);
       await saveFiles(userId, list);
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const albumsById = albumMap(albums);
@@ -571,6 +574,11 @@ export default async function handler(req, res) {
       await saveAlbums(userId, albums);
       const files = await getFiles(userId);
       const albumFiles = files.filter((f) => fileAlbumId(f) === targetId);
+      if (vis === 'public') {
+        const now = Math.floor(Date.now() / 1000);
+        albumFiles.forEach((f) => { if (f.visibility === 'public') f.publicAt = now; });
+        await saveFiles(userId, files);
+      }
       await syncAllFeedForUser(userId, albumFiles, albumMap(albums));
       return res.status(200).json({ success: true, albumId: targetId, visibility: vis });
     }
@@ -604,9 +612,11 @@ export default async function handler(req, res) {
       const idSet = new Set(ids.map(String));
       const list = await getFiles(userId);
       const touched = [];
+      const now = Math.floor(Date.now() / 1000);
       list.forEach((f) => {
         if (idSet.has(String(f.file_id)) || idSet.has(String(f.id))) {
           f.visibility = vis;
+          if (vis === 'public') f.publicAt = now;
           touched.push(f);
         }
       });
@@ -639,9 +649,10 @@ export default async function handler(req, res) {
       const { cursor } = body;
       const start = Number(cursor) || 0;
       const end = start + FEED_PAGE_SIZE - 1;
+      const total = await redis.zcard(PUBLIC_FEED_KEY);
       const members = await redis.zrange(PUBLIC_FEED_KEY, start, end, { rev: true });
       if (!members || members.length === 0) {
-        return res.status(200).json({ success: true, items: [], nextCursor: null });
+        return res.status(200).json({ success: true, items: [], nextCursor: null, total });
       }
       const byOwner = {};
       members.forEach((m) => {
@@ -676,7 +687,7 @@ export default async function handler(req, res) {
         })
       );
       const nextCursor = members.length < FEED_PAGE_SIZE ? null : end + 1;
-      return res.status(200).json({ success: true, items: withStats, nextCursor });
+      return res.status(200).json({ success: true, items: withStats, nextCursor, total });
     }
 
     // ── Xem toàn bộ 1 album công khai (từ tab Khám phá, click vào tên album) ──
