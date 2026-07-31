@@ -18,7 +18,7 @@ const MAX_FILES = 5000;
 const MAX_ALBUMS = 200;
 const FEED_PAGE_SIZE = 50;
 const DEFAULT_ALBUM_ID = 'default';
-const DEFAULT_ALBUM_NAME = 'Album chung';
+const DEFAULT_ALBUM_NAME = 'Album mặc định';
 
 // ── Keys ─────────────────────────────────────────────────────────────
 const filesKey = (userId) => `kamialbum:files:${userId}`;
