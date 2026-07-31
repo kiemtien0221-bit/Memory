@@ -217,12 +217,14 @@ async function syncAllFeedForUser(userId, list, albumsById) {
     const priv = list.filter((f) => !isEffectivelyPublic(f, albumsById));
     const ops = [];
     if (pub.length) {
-      const members = {};
-      pub.forEach((f) => {
+      const entries = pub.map((f) => {
         const album = albumsById[fileAlbumId(f)];
-        members[`${userId}::${f.id}`] = Number(album && album.publicAt) || Number(f.date) || Date.now() / 1000;
+        return {
+          score: Number(album && album.publicAt) || Number(f.date) || Date.now() / 1000,
+          member: `${userId}::${f.id}`,
+        };
       });
-      ops.push(redis.zadd(PUBLIC_FEED_KEY, members));
+      ops.push(redis.zadd(PUBLIC_FEED_KEY, ...entries));
     }
     if (priv.length) {
       ops.push(redis.zrem(PUBLIC_FEED_KEY, ...priv.map((f) => `${userId}::${f.id}`)));
