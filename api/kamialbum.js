@@ -348,6 +348,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: 'Thiếu userId' });
     }
 
+    if (action === 'resyncFeed') {
+      // Quét lại toàn bộ ảnh của user này, đồng bộ đúng theo logic công khai hiện tại (chỉ theo album).
+      // Dùng 1 lần để sửa dữ liệu cũ còn sót từ trước khi bỏ visibility riêng theo từng ảnh.
+      const [files, albumsRaw] = await Promise.all([getFiles(userId), getAlbums(userId)]);
+      const albums = await ensureDefaultAlbum(userId, albumsRaw);
+      await syncAllFeedForUser(userId, files, albumMap(albums));
+      return res.status(200).json({ success: true, count: files.length });
+    }
+
     if (action === 'list') {
       const [files, prefs, albumsRaw] = await Promise.all([getFiles(userId), getPrefs(userId), getAlbums(userId)]);
       const albums = await ensureDefaultAlbum(userId, albumsRaw);
