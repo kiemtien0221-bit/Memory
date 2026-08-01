@@ -47,7 +47,7 @@ function pickBotToken(channel) {
 }
 
 function emptyState() {
-  return { tabs: [], cur: 0, favs: [], hist: [], bms: [], offlinePages: [] };
+  return { tabs: [], cur: 0, tabsUpdatedAt: 0, favs: [], hist: [], bms: [], offlinePages: [] };
 }
 
 async function getState(userId) {
@@ -166,8 +166,9 @@ export default async function handler(req, res) {
       const state = await getState(userId);
       state.tabs = Array.isArray(tabs) ? tabs : [];
       state.cur = Number.isInteger(cur) ? cur : 0;
+      state.tabsUpdatedAt = Date.now(); // mốc thời gian server dùng để so sánh last-write-wins giữa các máy
       await saveState(userId, state);
-      return res.status(200).json({ success: true });
+      return res.status(200).json({ success: true, tabsUpdatedAt: state.tabsUpdatedAt });
     }
 
     // ── Trang tắt màn hình chủ ────────────────────────────────────────
