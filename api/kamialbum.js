@@ -537,7 +537,7 @@ export default async function handler(req, res) {
       const { albumId } = body;
       if (!albumId) return res.status(400).json({ success: false, error: 'Thiếu albumId' });
       if (albumId === DEFAULT_ALBUM_ID) {
-        return res.status(400).json({ success: false, error: 'Không thể xóa Album chung' });
+        return res.status(400).json({ success: false, error: 'Không thể xóa Album mặc định' });
       }
       const albums = await ensureDefaultAlbum(userId, await getAlbums(userId));
       const nextAlbums = albums.filter((a) => a.id !== albumId);
@@ -758,6 +758,25 @@ export default async function handler(req, res) {
     if (action === 'getPrefs') {
       const prefs = await getPrefs(userId);
       return res.status(200).json({ success: true, prefs });
+    }
+
+    // ── Trang cá nhân công khai (bấm avatar/tên ở tab Khám phá) ──────
+    if (action === 'profilePublic') {
+      const { ownerId } = body;
+      if (!ownerId) return res.status(400).json({ success: false, error: 'Thiếu ownerId' });
+      const [list, prefs, albumsRaw] = await Promise.all([getFiles(ownerId), getPrefs(ownerId), getAlbums(ownerId)]);
+      const albums = await ensureDefaultAlbum(ownerId, albumsRaw);
+      const albumsById = albumMap(albums);
+      const pubAlbums = albums
+        .filter((a) => a.visibility === 'public')
+        .map((a) => {
+          const files = list
+            .filter((f) => fileAlbumId(f) === a.id && isEffectivelyPublic(f, albumsById))
+            .sort((x, y) => (y.date || 0) - (x.date || 0));
+          return { id: a.id, name: a.name, count: files.length, cover: files[0] ? toPublicFile(files[0], albumsById) : null };
+        })
+        .filter((a) => a.count > 0);
+      return res.status(200).json({ success: true, ownerName: prefs.displayName || 'Ẩn danh', albums: pubAlbums });
     }
 
     return res.status(400).json({ success: false, error: 'Action không hợp lệ' });
