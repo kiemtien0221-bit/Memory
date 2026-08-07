@@ -103,9 +103,9 @@ const MEMORY_CONFIG = {
 const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 
 // ============ FORUM KNOWLEDGE INTEGRATION ============
-// Forum API — gọi qua HTTP endpoint thay vì Supabase trực tiếp
-// Để forum.js ở project Vercel khác, chỉ cần FORUM_API_URL
-const FORUM_API_URL = process.env.FORUM_API_URL || 'https://groq-chat-api.vercel.app/api/forum';
+// Forum config — same Supabase as forum.js
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // Cache forum categories (rarely change)
 let forumCategoriesCache = null;
@@ -117,6 +117,15 @@ const forumSearchCache = new SimpleCache(10 * 60000, 50); // 10 min TTL, 50 item
 
 // Max chars for forum knowledge injected into system prompt
 const MAX_FORUM_CHARS = 2000;
+
+// Supabase REST headers (reused)
+function getSupabaseHeaders() {
+  return {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    'Content-Type': 'application/json'
+  };
+}
 
 
 // Pattern "giá" đứng một mình quá rộng → false positive với "giá trị", "đánh giá"...
@@ -484,20 +493,26 @@ const searchTavily = (query) => {
 
 // ============ FORUM KNOWLEDGE FUNCTIONS ============
 
-// Fetch forum categories qua API (cached)
+// Fetch forum categories (cached)
 async function fetchForumCategories() {
   const now = Date.now();
   if (forumCategoriesCache && (now - forumCategoriesCacheTime) < FORUM_CAT_CACHE_TTL) {
     return forumCategoriesCache;
   }
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.log('⚠ Supabase not configured for forum');
+    return [];
+  }
   try {
-    const r = await fetch(`${FORUM_API_URL}?action=categories`, { timeout: 5000 });
-    if (!r.ok) throw new Error('Forum categories fetch failed: ' + r.status);
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/forum_categories?select=id,name,icon&order=sort_order.asc`,
+      { headers: getSupabaseHeaders() }
+    );
+    if (!r.ok) throw new Error('Forum categories fetch failed');
     const data = await r.json();
-    if (!data.success) throw new Error(data.error || 'Forum API error');
-    forumCategoriesCache = data.categories || [];
+    forumCategoriesCache = data || [];
     forumCategoriesCacheTime = now;
-    console.log(`📚 Loaded ${forumCategoriesCache.length} forum categories via API`);
+    console.log(`📚 Loaded ${forumCategoriesCache.length} forum categories`);
     return forumCategoriesCache;
   } catch (e) {
     console.error('❌ Forum categories error:', e.message);
@@ -507,11 +522,22 @@ async function fetchForumCategories() {
 
 // ============ OPTIMIZED FORUM KNOWLEDGE (Posts + Comments) ============
 
-
+// Extract meaningful keywords from Vietnamese text
+function extractKeywords(queryText) {
+  const stopWords = /\b(là|gì|của|và|hay|hoặc|như|thế nào|như thế nào|bạn|có|không|tôi|cho|về|một|các|những|được|trong|với|để|ở|tại|này|kia|đó|đây|bao nhiêu|mấy|bao|nên|làm sao|làm thế nào|theo|ý kiến|nghĩ|nghĩa|định nghĩa|giải thích|biết|nói|hỏi|trả lời|xin|vui lòng|giúp|hãy|đã|sẽ|đang|rồi|thì|vậy|nhé|ạ|ơi|nhỉ|ha)\b/gi;
+  return (queryText || '')
+    .replace(stopWords, ' ')
+    .replace(/[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]/gi, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(w => w.length >= 2)
+    .slice(0, 5);
+}
 
 // Tìm kiếm forum posts + comments — tối ưu với parallel search
-// Tìm kiếm forum qua API — không cần Supabase trực tiếp
 async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+
   const cacheKey = `forum:${categoryId}:${normalizeForCache(queryText || '')}`;
   const cached = forumSearchCache.get(cacheKey);
   if (cached) {
@@ -520,38 +546,130 @@ async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
   }
 
   try {
-    // Gọi API search của forum.js (đã hỗ trợ search posts + comments)
-    const searchUrl = `${FORUM_API_URL}?action=search&q=${encodeURIComponent(queryText || '')}${categoryId ? '&category_id=' + categoryId : ''}`;
-    const r = await fetch(searchUrl, { timeout: 8000 });
-    if (!r.ok) throw new Error('Forum search API failed: ' + r.status);
-
-    const data = await r.json();
-    if (!data.success || !data.posts || data.posts.length === 0) {
-      console.log(`⚠ No forum posts match: ${queryText}`);
+    const keywords = extractKeywords(queryText);
+    if (keywords.length === 0) {
+      console.log('⚠ No meaningful keywords extracted from query');
       return null;
     }
 
-    // Lấy top results, format giống cũ
-    const items = data.posts.slice(0, maxResults).map(p => ({
-      title: p.title,
-      content: (p.content || '').slice(0, 500),
-      author: p.author || p.username || 'Ẩn danh',
-      date: p.created_at,
-      type: 'post'
-    }));
+    // Build ilike conditions
+    const orConditions = keywords.map(k => `title.ilike.*${encodeURIComponent(k)}*,content.ilike.*${encodeURIComponent(k)}*`).join(',');
+    let postsUrl = `${SUPABASE_URL}/rest/v1/forum_posts?select=id,title,content,author,username,created_at&status=eq.approved&or=(${orConditions})&order=created_at.desc&limit=${maxResults}`;
+    if (categoryId) postsUrl += `&category_id=eq.${encodeURIComponent(categoryId)}`;
+
+    // Search comments with post context
+    const commentConditions = keywords.map(k => `content.ilike.*${encodeURIComponent(k)}*`).join(',');
+    let commentsUrl = `${SUPABASE_URL}/rest/v1/forum_comments?select=*,forum_posts!inner(id,title,category_id)&forum_posts.status=eq.approved&or=(${commentConditions})&order=created_at.desc&limit=${maxResults}`;
+    if (categoryId) commentsUrl += `&forum_posts.category_id=eq.${encodeURIComponent(categoryId)}`;
+
+    // Parallel fetch
+    const [postsR, commentsR] = await Promise.all([
+      fetch(postsUrl, { headers: getSupabaseHeaders() }),
+      fetch(commentsUrl, { headers: getSupabaseHeaders() })
+    ]);
+
+    let posts = postsR.ok ? await postsR.json() : [];
+    let comments = commentsR.ok ? await commentsR.json() : [];
+
+    if (!posts.length && !comments.length) {
+      console.log(`⚠ No forum content match keywords: ${keywords.join(', ')}`);
+      return null;
+    }
+
+    // Score posts
+    const scoredPosts = posts.map(p => {
+      const title = (p.title || '').toLowerCase();
+      const content = (p.content || '').toLowerCase();
+      const titleScore = keywords.filter(k => title.includes(k.toLowerCase())).length * 3;
+      const contentScore = keywords.filter(k => content.includes(k.toLowerCase())).length;
+      return { ...p, score: titleScore + contentScore, type: 'post' };
+    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
+
+    // Score comments
+    const scoredComments = comments.map(c => {
+      const content = (c.content || '').toLowerCase();
+      const score = keywords.filter(k => content.includes(k.toLowerCase())).length;
+      return { 
+        ...c, 
+        score, 
+        type: 'comment',
+        postTitle: c.forum_posts?.title || 'Bài viết'
+      };
+    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
+
+    // Merge top results
+    const combined = [...scoredPosts, ...scoredComments]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxResults);
 
     const result = {
       source: 'KamiForum',
       categoryId,
-      items
+      items: combined.map(item => ({
+        title: item.type === 'post' ? item.title : `💬 ${item.postTitle}`,
+        content: (item.content || '').slice(0, 500),
+        author: item.author || item.username || 'Ẩn danh',
+        date: item.created_at,
+        type: item.type
+      }))
     };
 
     forumSearchCache.set(cacheKey, result);
-    console.log(`✅ Forum knowledge: ${items.length} posts via API`);
+    console.log(`✅ Forum knowledge: ${combined.length} items matched [${keywords.join(', ')}]`);
     return result;
   } catch (e) {
     console.error('❌ Forum search error:', e.message);
     return null;
+  }
+}
+
+// AI-powered forum category matching
+// Returns { matchedCategory: {id, name} | null, confidence: number }
+async function matchForumCategory(message, groq) {
+  const categories = await fetchForumCategories();
+  if (categories.length === 0) return { matchedCategory: null, confidence: 0 };
+
+  const catList = categories.map(c => `${c.id}:${c.name}`).join(', ');
+
+  try {
+    const response = await groq.chat.completions.create({
+      messages: [
+        {
+          role: 'system',
+          content: `Bạn là bộ lọc chủ đề. Người dùng đang hỏi một câu hỏi. Hãy xác định câu hỏi này có khớp với danh mục nào trong diễn đàn kiến thức không.
+
+Các danh mục diễn đàn: ${catList}
+
+Trả về JSON: {"categoryId": number|null, "confidence": number}
+- categoryId: ID danh mục khớp nhất, hoặc null nếu không khớp
+- confidence: 0-1, chỉ trả >0.7 nếu thực sự khớp chủ đề
+
+Ví dụ: "cách nấu cơm" → mẹo vặt. "Bitcoin là gì" → kiến thức chung. "chào bạn" → null.`
+        },
+        {
+          role: 'user',
+          content: `Câu hỏi: "${message}"`
+        }
+      ],
+      model: 'openai/gpt-oss-20b',
+      temperature: 0,
+      max_tokens: 60,
+      response_format: { type: "json_object" },
+      reasoning_effort: 'low',
+      include_reasoning: false
+    });
+
+    const result = safeParseJSON(response.choices[0]?.message?.content || '{}');
+    const matched = categories.find(c => c.id === result.categoryId);
+
+    if (matched && result.confidence >= 0.7) {
+      console.log(`🎯 Forum category matched: ${matched.name} (confidence: ${result.confidence})`);
+      return { matchedCategory: matched, confidence: result.confidence };
+    }
+    return { matchedCategory: null, confidence: 0 };
+  } catch (e) {
+    console.error('Forum category match error:', e.message);
+    return { matchedCategory: null, confidence: 0 };
   }
 }
 
@@ -1564,7 +1682,7 @@ ${searchJson}
 
     // ── Forum knowledge section (posts + comments) ──
     let forumSection = '';
-    if (forumKnowledge && categories.length > 0) {
+    if (forumKnowledge) {
       const compactForum = {
         source: forumKnowledge.source,
         category: categories.find(c => c.id === forumKnowledge.categoryId)?.name || '',
