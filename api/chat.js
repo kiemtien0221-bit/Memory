@@ -102,6 +102,32 @@ const MEMORY_CONFIG = {
 // Whitelist mimeType hợp lệ cho vision
 const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 
+// ============ FORUM KNOWLEDGE INTEGRATION ============
+// Forum config — same Supabase as forum.js
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Cache forum categories (rarely change)
+let forumCategoriesCache = null;
+let forumCategoriesCacheTime = 0;
+const FORUM_CAT_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+// Cache forum search results per query
+const forumSearchCache = new SimpleCache(10 * 60000, 50); // 10 min TTL, 50 items
+
+// Max chars for forum knowledge injected into system prompt
+const MAX_FORUM_CHARS = 2000;
+
+// Supabase REST headers (reused)
+function getSupabaseHeaders() {
+  return {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    'Content-Type': 'application/json'
+  };
+}
+
+
 // Pattern "giá" đứng một mình quá rộng → false positive với "giá trị", "đánh giá"...
 // Chỉ match cụm từ đầy đủ, không match "giá" đơn.
 // Xóa "đang" khỏi current vì match gần như mọi câu tiến hành ngữ → false positive.
@@ -462,6 +488,212 @@ const searchTavily = (query) => {
     };
   }, 'Tavily');
 };
+
+
+
+// ============ FORUM KNOWLEDGE FUNCTIONS ============
+
+// Fetch forum categories (cached)
+async function fetchForumCategories() {
+  const now = Date.now();
+  if (forumCategoriesCache && (now - forumCategoriesCacheTime) < FORUM_CAT_CACHE_TTL) {
+    return forumCategoriesCache;
+  }
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.log('⚠ Supabase not configured for forum');
+    return [];
+  }
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/forum_categories?select=id,name,icon&order=sort_order.asc`,
+      { headers: getSupabaseHeaders() }
+    );
+    if (!r.ok) throw new Error('Forum categories fetch failed');
+    const data = await r.json();
+    forumCategoriesCache = data || [];
+    forumCategoriesCacheTime = now;
+    console.log(`📚 Loaded ${forumCategoriesCache.length} forum categories`);
+    return forumCategoriesCache;
+  } catch (e) {
+    console.error('❌ Forum categories error:', e.message);
+    return [];
+  }
+}
+
+// ============ OPTIMIZED FORUM KNOWLEDGE (Posts + Comments) ============
+
+// Extract meaningful keywords from Vietnamese text
+function extractKeywords(queryText) {
+  const stopWords = /\b(là|gì|của|và|hay|hoặc|như|thế nào|như thế nào|bạn|có|không|tôi|cho|về|một|các|những|được|trong|với|để|ở|tại|này|kia|đó|đây|bao nhiêu|mấy|bao|nên|làm sao|làm thế nào|theo|ý kiến|nghĩ|nghĩa|định nghĩa|giải thích|biết|nói|hỏi|trả lời|xin|vui lòng|giúp|hãy|đã|sẽ|đang|rồi|thì|vậy|nhé|ạ|ơi|nhỉ|ha)\b/gi;
+  return (queryText || '')
+    .replace(stopWords, ' ')
+    .replace(/[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]/gi, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(w => w.length >= 2)
+    .slice(0, 5);
+}
+
+// Tìm kiếm forum posts + comments — tối ưu với parallel search
+async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+
+  const cacheKey = `forum:${categoryId}:${normalizeForCache(queryText || '')}`;
+  const cached = forumSearchCache.get(cacheKey);
+  if (cached) {
+    console.log('💾 Forum search cache hit');
+    return cached;
+  }
+
+  try {
+    const keywords = extractKeywords(queryText);
+    if (keywords.length === 0) {
+      console.log('⚠ No meaningful keywords extracted from query');
+      return null;
+    }
+
+    // Build ilike conditions
+    const orConditions = keywords.map(k => `title.ilike.*${encodeURIComponent(k)}*,content.ilike.*${encodeURIComponent(k)}*`).join(',');
+    let postsUrl = `${SUPABASE_URL}/rest/v1/forum_posts?select=id,title,content,author,username,created_at&status=eq.approved&or=(${orConditions})&order=created_at.desc&limit=${maxResults}`;
+    if (categoryId) postsUrl += `&category_id=eq.${encodeURIComponent(categoryId)}`;
+
+    // Search comments with post context
+    const commentConditions = keywords.map(k => `content.ilike.*${encodeURIComponent(k)}*`).join(',');
+    let commentsUrl = `${SUPABASE_URL}/rest/v1/forum_comments?select=*,forum_posts!inner(id,title,category_id)&forum_posts.status=eq.approved&or=(${commentConditions})&order=created_at.desc&limit=${maxResults}`;
+    if (categoryId) commentsUrl += `&forum_posts.category_id=eq.${encodeURIComponent(categoryId)}`;
+
+    // Parallel fetch
+    const [postsR, commentsR] = await Promise.all([
+      fetch(postsUrl, { headers: getSupabaseHeaders() }),
+      fetch(commentsUrl, { headers: getSupabaseHeaders() })
+    ]);
+
+    let posts = postsR.ok ? await postsR.json() : [];
+    let comments = commentsR.ok ? await commentsR.json() : [];
+
+    if (!posts.length && !comments.length) {
+      console.log(`⚠ No forum content match keywords: ${keywords.join(', ')}`);
+      return null;
+    }
+
+    // Score posts
+    const scoredPosts = posts.map(p => {
+      const title = (p.title || '').toLowerCase();
+      const content = (p.content || '').toLowerCase();
+      const titleScore = keywords.filter(k => title.includes(k.toLowerCase())).length * 3;
+      const contentScore = keywords.filter(k => content.includes(k.toLowerCase())).length;
+      return { ...p, score: titleScore + contentScore, type: 'post' };
+    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
+
+    // Score comments
+    const scoredComments = comments.map(c => {
+      const content = (c.content || '').toLowerCase();
+      const score = keywords.filter(k => content.includes(k.toLowerCase())).length;
+      return { 
+        ...c, 
+        score, 
+        type: 'comment',
+        postTitle: c.forum_posts?.title || 'Bài viết'
+      };
+    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
+
+    // Merge top results
+    const combined = [...scoredPosts, ...scoredComments]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxResults);
+
+    const result = {
+      source: 'KamiForum',
+      categoryId,
+      items: combined.map(item => ({
+        title: item.type === 'post' ? item.title : `💬 ${item.postTitle}`,
+        content: (item.content || '').slice(0, 500),
+        author: item.author || item.username || 'Ẩn danh',
+        date: item.created_at,
+        type: item.type
+      }))
+    };
+
+    forumSearchCache.set(cacheKey, result);
+    console.log(`✅ Forum knowledge: ${combined.length} items matched [${keywords.join(', ')}]`);
+    return result;
+  } catch (e) {
+    console.error('❌ Forum search error:', e.message);
+    return null;
+  }
+}
+
+// AI-powered forum category matching
+// Returns { matchedCategory: {id, name} | null, confidence: number }
+async function matchForumCategory(message, groq) {
+  const categories = await fetchForumCategories();
+  if (categories.length === 0) return { matchedCategory: null, confidence: 0 };
+
+  const catList = categories.map(c => `${c.id}:${c.name}`).join(', ');
+
+  try {
+    const response = await groq.chat.completions.create({
+      messages: [
+        {
+          role: 'system',
+          content: `Bạn là bộ lọc chủ đề. Người dùng đang hỏi một câu hỏi. Hãy xác định câu hỏi này có khớp với danh mục nào trong diễn đàn kiến thức không.
+
+Các danh mục diễn đàn: ${catList}
+
+Trả về JSON: {"categoryId": number|null, "confidence": number}
+- categoryId: ID danh mục khớp nhất, hoặc null nếu không khớp
+- confidence: 0-1, chỉ trả >0.7 nếu thực sự khớp chủ đề
+
+Ví dụ: "cách nấu cơm" → mẹo vặt. "Bitcoin là gì" → kiến thức chung. "chào bạn" → null.`
+        },
+        {
+          role: 'user',
+          content: `Câu hỏi: "${message}"`
+        }
+      ],
+      model: 'openai/gpt-oss-20b',
+      temperature: 0,
+      max_tokens: 60,
+      response_format: { type: "json_object" },
+      reasoning_effort: 'low',
+      include_reasoning: false
+    });
+
+    const result = safeParseJSON(response.choices[0]?.message?.content || '{}');
+    const matched = categories.find(c => c.id === result.categoryId);
+
+    if (matched && result.confidence >= 0.7) {
+      console.log(`🎯 Forum category matched: ${matched.name} (confidence: ${result.confidence})`);
+      return { matchedCategory: matched, confidence: result.confidence };
+    }
+    return { matchedCategory: null, confidence: 0 };
+  } catch (e) {
+    console.error('Forum category match error:', e.message);
+    return { matchedCategory: null, confidence: 0 };
+  }
+}
+
+// Quick regex-based forum category detection (before AI)
+function quickForumDetect(message, categories) {
+  const lower = message.toLowerCase();
+
+  // Keyword mapping for fast pre-filtering
+  const keywordMap = {
+    'kiến thức chung': /(kiến thức|học|định nghĩa|là gì|khái niệm|lịch sử|khoa học|toán|vật lý|hóa học|sinh học|địa lý|văn học)/,
+    'mẹo vặt': /(mẹo|tip|hack|cách|hướng dẫn|làm sao|nấu|nướng|sửa|vệ sinh|dọn|tẩy|làm sạch|tiết kiệm)/,
+    'công nghệ': /(công nghệ|tech|lập trình|code|python|javascript|app|android|ios|phone|máy tính|software|hardware|ai|blockchain)/,
+    'đời sống': /(đời sống|sức khỏe|tâm lý|tình cảm|gia đình|bạn bè|xã hội|phong tục|văn hóa|du lịch|ăn uống)/
+  };
+
+  for (const cat of categories) {
+    const pattern = keywordMap[cat.name];
+    if (pattern && pattern.test(lower)) {
+      return { matchedCategory: cat, confidence: 0.75 };
+    }
+  }
+
+  return { matchedCategory: null, confidence: 0 };
+}
 
 // ============ END SEARCH SOURCES ============
 
@@ -1346,8 +1578,21 @@ export default async function handler(req, res) {
       }
     }
 
+    // ── FORUM KNOWLEDGE: check if question matches a forum category ──
+    let forumKnowledge = null;
+    let forumCategoryMatched = null;
+    const categories = await fetchForumCategories();
+    if (categories.length > 0) {
+      // Quick regex match first (fast, no AI cost)
+      const quickForum = quickForumDetect(message, categories);
+      if (quickForum.matchedCategory) {
+        forumCategoryMatched = quickForum.matchedCategory;
+        forumKnowledge = await searchForumKnowledge(forumCategoryMatched.id, message, 3);
+      }
+    }
+
     if (!cachedDecision && searchDecision.confidence < 0.8) {
-      // Background: AI detection + prefetch search cho lần sau
+      // Background: AI detection + prefetch search + forum category matching cho lần sau
       // (kết quả sẽ được cache, không dùng cho response này)
       callTempGroqWithRetry(userId, async (groq) => {
         const aiDecision = await shouldSearch(message, groq);
@@ -1357,6 +1602,17 @@ export default async function handler(req, res) {
           const bgResult = await smartSearch(message, aiDecision.type);
           if (bgResult) {
             console.log(`✅ Background search cached for next request: ${bgResult.source}`);
+          }
+        }
+
+        // Background forum matching (if quick regex didn't match)
+        if (!forumKnowledge && categories.length > 0) {
+          const forumMatch = await matchForumCategory(message, groq);
+          if (forumMatch.matchedCategory) {
+            const bgForum = await searchForumKnowledge(forumMatch.matchedCategory.id, message, 3);
+            if (bgForum) {
+              console.log(`✅ Background forum cached for next request: ${forumMatch.matchedCategory.name}`);
+            }
           }
         }
 
@@ -1424,6 +1680,31 @@ ${searchJson}
 `
       : '';
 
+    // ── Forum knowledge section (posts + comments) ──
+    let forumSection = '';
+    if (forumKnowledge) {
+      const compactForum = {
+        source: forumKnowledge.source,
+        category: categories.find(c => c.id === forumKnowledge.categoryId)?.name || '',
+        items: (forumKnowledge.items || []).map(p => ({
+          title: p.title,
+          content: (p.content || '').slice(0, 400),
+          author: p.author,
+          type: p.type || 'post'
+        }))
+      };
+      let forumJson = JSON.stringify(compactForum);
+      if (forumJson.length > MAX_FORUM_CHARS) {
+        forumJson = forumJson.slice(0, MAX_FORUM_CHARS) + '..."}';
+      }
+      forumSection = `
+📚 KIẾN THỨC TỪ DIỄN ĐÀN (dữ liệu nội bộ từ cộng đồng):
+--- BẮT ĐẦU DỮ LIỆU ---
+${forumJson}
+--- KẾT THÚC DỮ LIỆU ---
+`;
+    }
+
     const systemPrompt = {
       role: 'system',
       content: `Bạn là Kami – AI thông minh được tạo ra bởi Nguyễn Đức Thạnh.
@@ -1437,6 +1718,7 @@ ${Object.entries(userProfile).map(([k, v]) => `- ${k}: ${v}`).join('\n')}
 ${summaryContext}
 
 ${searchSection}
+${forumSection}
 💾 Context: ${context.contextInfo.messagesInContext} tin mới + ${context.contextInfo.summariesInContext} summaries
 📊 Tổng: ${context.contextInfo.totalMessages} tin, ${context.contextInfo.totalSummaries} summaries
 Nguyên tắc: Ưu tiên sự thật, không bịa đặt. Nếu không chắc thì nói thẳng.
@@ -1549,6 +1831,8 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
         storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
         searchUsed: !!searchResult,
         searchSource: searchResult?.source || null,
+        forumUsed: !!forumKnowledge,
+        forumCategory: forumKnowledge?.categoryId || null,
         modelUsed: 'openai/gpt-oss-120b',
         cached: false
       }
