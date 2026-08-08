@@ -303,7 +303,8 @@ async function handleComment(body, SUPABASE_URL, headers, res) {
     parent_id: parent_id || null
   };
 
-  // Insert comment + update comment_count atomically
+  // Insert comment — comment_count tự tăng bởi trigger trg_post_comment_count
+  // trong DB (atomic), KHÔNG tự cập nhật lại ở đây nữa để tránh đếm đôi.
   const r = await fetch(`${SUPABASE_URL}/rest/v1/forum_comments`, {
     method: 'POST',
     headers,
@@ -313,21 +314,6 @@ async function handleComment(body, SUPABASE_URL, headers, res) {
   if (!r.ok) {
     console.error('Comment insert error:', await r.text());
     return res.status(500).json({ success: false, error: 'Không lưu được comment' });
-  }
-
-  // Update comment_count
-  try {
-    const postR = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}&select=comment_count`, { headers });
-    const posts = await postR.json();
-    const currentCount = posts[0]?.comment_count || 0;
-
-    await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}`, {
-      method: 'PATCH',
-      headers: { ...headers, Prefer: 'return=minimal' },
-      body: JSON.stringify({ comment_count: currentCount + 1 })
-    });
-  } catch (e) {
-    console.error('Failed to update comment_count:', e.message);
   }
 
   const result = await r.json();
@@ -358,23 +344,8 @@ async function handleDeleteComment(body, SUPABASE_URL, headers, res) {
 
   if (!r.ok) throw new Error(await r.text());
 
-  // Decrement comment_count
-  try {
-    const postId = comments[0].post_id;
-    const postR = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${postId}&select=comment_count`, { headers });
-    const posts = await postR.json();
-    const currentCount = posts[0]?.comment_count || 0;
-
-    if (currentCount > 0) {
-      await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${postId}`, {
-        method: 'PATCH',
-        headers: { ...headers, Prefer: 'return=minimal' },
-        body: JSON.stringify({ comment_count: currentCount - 1 })
-      });
-    }
-  } catch (e) {
-    console.error('Failed to decrement comment_count:', e.message);
-  }
+  // comment_count tự giảm bởi trigger trg_post_comment_count khi DELETE
+  // (trigger dùng GREATEST(0, ...) nên không âm) — không tự trừ ở đây nữa.
 
   return res.status(200).json({ success: true, message: 'Đã xóa comment' });
 }

@@ -212,17 +212,6 @@ async function matchForumCategory(message, groq, categories) {
   }
 }
 
-function extractKeywords(queryText) {
-  const stopWords = /\b(là|gì|của|và|hay|hoặc|như|thế nào|như thế nào|bạn|có|không|tôi|cho|về|một|các|những|được|trong|với|để|ở|tại|này|kia|đó|đây|bao nhiêu|mấy|bao|nên|làm sao|làm thế nào|theo|ý kiến|nghĩ|nghĩa|định nghĩa|giải thích|biết|nói|hỏi|trả lời|xin|vui lòng|giúp|hãy|đã|sẽ|đang|rồi|thì|vậy|nhé|ạ|ơi|nhỉ|ha)\b/gi;
-  return (queryText || '')
-    .replace(stopWords, ' ')
-    .replace(/[^\w\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]/gi, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(w => w.length >= 2)
-    .slice(0, 5);
-}
-
 async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return null;
 
@@ -233,74 +222,54 @@ async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
     return cached;
   }
 
+  const cleanQuery = (queryText || '').trim();
+  if (!cleanQuery) {
+    console.log('⚠ Empty query, skip forum search');
+    return null;
+  }
+
   try {
-    const keywords = extractKeywords(queryText);
-    if (keywords.length === 0) {
-      console.log('⚠ No meaningful keywords extracted from query');
+    // Dùng RPC search_forum_content() có sẵn trong schema (FTS + ts_rank,
+    // dùng GIN index idx_forum_posts_fts / idx_forum_comments_fts) thay vì
+    // tự query ilike + tự chấm điểm ở JS — 1 round-trip, đã sắp theo rank.
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/search_forum_content`, {
+      method: 'POST',
+      headers: getSupabaseHeaders(),
+      body: JSON.stringify({
+        search_query: cleanQuery,
+        p_category_id: categoryId || null,
+        p_limit: maxResults
+      })
+    });
+
+    if (!r.ok) {
+      console.error('❌ Forum RPC search error:', await r.text());
       return null;
     }
 
-    const orConditions = keywords.map(k => `title.ilike.*${encodeURIComponent(k)}*,content.ilike.*${encodeURIComponent(k)}*`).join(',');
-    let postsUrl = `${SUPABASE_URL}/rest/v1/forum_posts?select=id,title,content,author,username,created_at,view_count,comment_count,category_id&status=eq.approved&or=(${orConditions})&order=created_at.desc&limit=${maxResults}`;
-    if (categoryId) postsUrl += `&category_id=eq.${encodeURIComponent(categoryId)}`;
-
-    const commentConditions = keywords.map(k => `content.ilike.*${encodeURIComponent(k)}*`).join(',');
-    let commentsUrl = `${SUPABASE_URL}/rest/v1/forum_comments?select=*,forum_posts!inner(id,title,category_id)&forum_posts.status=eq.approved&or=(${commentConditions})&order=created_at.desc&limit=${maxResults}`;
-    if (categoryId) commentsUrl += `&forum_posts.category_id=eq.${encodeURIComponent(categoryId)}`;
-
-    const [postsR, commentsR] = await Promise.all([
-      fetch(postsUrl, { headers: getSupabaseHeaders() }),
-      fetch(commentsUrl, { headers: getSupabaseHeaders() })
-    ]);
-
-    let posts = postsR.ok ? await postsR.json() : [];
-    let comments = commentsR.ok ? await commentsR.json() : [];
-
-    if (!posts.length && !comments.length) {
-      console.log(`⚠ No forum content match keywords: ${keywords.join(', ')}`);
+    const rows = await r.json();
+    if (!rows.length) {
+      console.log(`⚠ No forum content match query: "${cleanQuery}"`);
       return null;
     }
-
-    const scoredPosts = posts.map(p => {
-      const title = (p.title || '').toLowerCase();
-      const content = (p.content || '').toLowerCase();
-      const titleScore = keywords.filter(k => title.includes(k.toLowerCase())).length * 3;
-      const contentScore = keywords.filter(k => content.includes(k.toLowerCase())).length;
-      return { ...p, score: titleScore + contentScore, type: 'post' };
-    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
-
-    const scoredComments = comments.map(c => {
-      const content = (c.content || '').toLowerCase();
-      const score = keywords.filter(k => content.includes(k.toLowerCase())).length;
-      return { 
-        ...c, 
-        score, 
-        type: 'comment',
-        postTitle: c.forum_posts?.title || 'Bài viết'
-      };
-    }).sort((a, b) => b.score - a.score || new Date(b.created_at) - new Date(a.created_at));
-
-    const combined = [...scoredPosts, ...scoredComments]
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxResults);
 
     const result = {
       source: 'KamiForum',
       categoryId,
-      items: combined.map(item => ({
-        id: item.id,
-        title: item.type === 'post' ? item.title : `💬 ${item.postTitle}`,
-        content: (item.content || '').slice(0, 500),
-        author: item.author || item.username || 'Ẩn danh',
-        date: item.created_at,
-        type: item.type,
-        viewCount: item.view_count || 0,
-        commentCount: item.comment_count || 0
+      items: rows.map(row => ({
+        id: row.id,
+        title: row.type === 'post' ? row.title : `💬 ${row.title}`,
+        content: (row.content || '').slice(0, 500),
+        author: row.author || row.username || 'Ẩn danh',
+        date: row.created_at,
+        type: row.type,
+        viewCount: row.view_count || 0,
+        commentCount: row.comment_count || 0
       }))
     };
 
     forumSearchCache.set(cacheKey, result);
-    console.log(`✅ Forum knowledge: ${combined.length} items matched [${keywords.join(', ')}]`);
+    console.log(`✅ Forum knowledge (RPC): ${rows.length} items for "${cleanQuery}"`);
     return result;
   } catch (e) {
     console.error('❌ Forum search error:', e.message);
