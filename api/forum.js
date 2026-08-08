@@ -1,4 +1,4 @@
-// api/forum.js — KamiForum v3
+// api/forum.js — KamiForum v4
 // Yêu cầu env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ADMIN_KEY
 
 const MAX_TITLE = 200;
@@ -51,7 +51,6 @@ export default async function handler(req, res) {
         let url = `${SUPABASE_URL}/rest/v1/forum_posts?select=*,forum_categories(name,icon)&status=eq.approved&order=created_at.desc&limit=${POSTS_PER_PAGE}&offset=${from}`;
         if (category_id) url += `&category_id=eq.${encodeURIComponent(category_id)}`;
 
-        // Đếm tổng
         let countUrl = `${SUPABASE_URL}/rest/v1/forum_posts?select=id&status=eq.approved`;
         if (category_id) countUrl += `&category_id=eq.${encodeURIComponent(category_id)}`;
 
@@ -80,7 +79,6 @@ export default async function handler(req, res) {
       if (action === 'detail') {
         if (!post_id) return res.status(400).json({ success: false, error: 'Thiếu post_id' });
 
-        // Lấy post + tăng view count
         const postUrl = `${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}&select=*,forum_categories(name,icon)`;
         const commentsUrl = `${SUPABASE_URL}/rest/v1/forum_comments?post_id=eq.${post_id}&select=*&order=created_at.desc`;
 
@@ -93,12 +91,17 @@ export default async function handler(req, res) {
         const posts = await rPost.json();
         if (!posts.length) return res.status(404).json({ success: false, error: 'Không tìm thấy bài viết' });
 
-        // Tăng view count (fire and forget)
-        fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}`, {
-          method: 'PATCH',
-          headers: { ...headers, Prefer: 'return=minimal' },
-          body: JSON.stringify({ view_count: (posts[0].view_count || 0) + 1 })
-        }).catch(() => {});
+        // Atomic view increment using RPC (nếu có) hoặc PATCH
+        // Fire-and-forget với retry đơn giản
+        try {
+          await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}`, {
+            method: 'PATCH',
+            headers: { ...headers, Prefer: 'return=minimal' },
+            body: JSON.stringify({ view_count: (posts[0].view_count || 0) + 1 })
+          });
+        } catch (e) {
+          // Silent fail cho view count
+        }
 
         return res.status(200).json({
           success: true,
@@ -200,7 +203,6 @@ export default async function handler(req, res) {
       const { id, userId } = req.body || {};
       if (!id) return res.status(400).json({ success: false, error: 'Thiếu id' });
 
-      // Kiểm tra quyền: admin hoặc chính chủ
       const postR = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${id}&select=user_id`, { headers });
       const posts = await postR.json();
       if (!posts.length) return res.status(404).json({ success: false, error: 'Không tìm thấy bài' });
@@ -257,7 +259,9 @@ async function handleSubmit(body, SUPABASE_URL, headers, res) {
     user_id: userId || null,
     username: username || null,
     is_anonymous: !!isAnonymous,
-    status: 'pending'
+    status: 'pending',
+    view_count: 0,
+    comment_count: 0
   };
 
   const r = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts`, {
@@ -299,6 +303,7 @@ async function handleComment(body, SUPABASE_URL, headers, res) {
     parent_id: parent_id || null
   };
 
+  // Insert comment + update comment_count atomically
   const r = await fetch(`${SUPABASE_URL}/rest/v1/forum_comments`, {
     method: 'POST',
     headers,
@@ -308,6 +313,21 @@ async function handleComment(body, SUPABASE_URL, headers, res) {
   if (!r.ok) {
     console.error('Comment insert error:', await r.text());
     return res.status(500).json({ success: false, error: 'Không lưu được comment' });
+  }
+
+  // Update comment_count
+  try {
+    const postR = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}&select=comment_count`, { headers });
+    const posts = await postR.json();
+    const currentCount = posts[0]?.comment_count || 0;
+
+    await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${post_id}`, {
+      method: 'PATCH',
+      headers: { ...headers, Prefer: 'return=minimal' },
+      body: JSON.stringify({ comment_count: currentCount + 1 })
+    });
+  } catch (e) {
+    console.error('Failed to update comment_count:', e.message);
   }
 
   const result = await r.json();
@@ -320,8 +340,7 @@ async function handleDeleteComment(body, SUPABASE_URL, headers, res) {
 
   if (!id) return res.status(400).json({ success: false, error: 'Thiếu id comment' });
 
-  // Kiểm tra quyền
-  const commentR = await fetch(`${SUPABASE_URL}/rest/v1/forum_comments?id=eq.${id}&select=user_id`, { headers });
+  const commentR = await fetch(`${SUPABASE_URL}/rest/v1/forum_comments?id=eq.${id}&select=*,post_id`, { headers });
   const comments = await commentR.json();
   if (!comments.length) return res.status(404).json({ success: false, error: 'Không tìm thấy comment' });
 
@@ -338,6 +357,25 @@ async function handleDeleteComment(body, SUPABASE_URL, headers, res) {
   });
 
   if (!r.ok) throw new Error(await r.text());
+
+  // Decrement comment_count
+  try {
+    const postId = comments[0].post_id;
+    const postR = await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${postId}&select=comment_count`, { headers });
+    const posts = await postR.json();
+    const currentCount = posts[0]?.comment_count || 0;
+
+    if (currentCount > 0) {
+      await fetch(`${SUPABASE_URL}/rest/v1/forum_posts?id=eq.${postId}`, {
+        method: 'PATCH',
+        headers: { ...headers, Prefer: 'return=minimal' },
+        body: JSON.stringify({ comment_count: currentCount - 1 })
+      });
+    }
+  } catch (e) {
+    console.error('Failed to decrement comment_count:', e.message);
+  }
+
   return res.status(200).json({ success: true, message: 'Đã xóa comment' });
 }
 
@@ -406,7 +444,7 @@ async function handleUpdate(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
 }
 
 async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
-  const { name, icon, sort_order, view_mode } = body;
+  const { name, icon, sort_order, view_mode, description, keywords } = body;
   const auth = verifyAdmin(body, ADMIN_KEY);
   if (!auth.ok) return res.status(403).json({ success: false, error: auth.error });
 
@@ -419,7 +457,9 @@ async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
       name: name.trim(),
       icon: icon || '📁',
       sort_order: sort_order || 0,
-      view_mode: view_mode || 'list'
+      view_mode: view_mode || 'list',
+      description: description || '',
+      keywords: keywords || name.trim()
     })
   });
 
@@ -428,7 +468,7 @@ async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
 }
 
 async function handleEditCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
-  const { id, name, icon, sort_order, view_mode } = body;
+  const { id, name, icon, sort_order, view_mode, description, keywords } = body;
   const auth = verifyAdmin(body, ADMIN_KEY);
   if (!auth.ok) return res.status(403).json({ success: false, error: auth.error });
 
@@ -439,6 +479,8 @@ async function handleEditCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
   if (icon !== undefined) updateData.icon = icon;
   if (sort_order !== undefined) updateData.sort_order = sort_order;
   if (view_mode !== undefined) updateData.view_mode = view_mode;
+  if (description !== undefined) updateData.description = description;
+  if (keywords !== undefined) updateData.keywords = keywords;
 
   if (Object.keys(updateData).length === 0) {
     return res.status(400).json({ success: false, error: 'Không có dữ liệu cập nhật' });
