@@ -219,6 +219,32 @@ async function matchForumCategory(message, groq, categories) {
   }
 }
 
+// Danh sách từ nối/đệm tiếng Việt phổ biến, loại bỏ trước khi tìm forum
+// để không bị lẫn vào tsquery (chúng không mang ý nghĩa tìm kiếm).
+const VN_STOPWORDS = new Set([
+  'kiến', 'thức', 'về', 'và', 'là', 'của', 'cho', 'các', 'những', 'một',
+  'có', 'không', 'gì', 'như', 'thế', 'nào', 'với', 'để', 'ở', 'tại',
+  'này', 'kia', 'đó', 'đây', 'trong', 'trên', 'dưới', 'bị', 'được',
+  'hay', 'hoặc', 'rất', 'quá', 'cũng', 'đã', 'đang', 'sẽ', 'thì',
+  'mà', 'nên', 'vì', 'nếu', 'khi', 'lúc', 'cách', 'làm', 'sao', 'ạ'
+]);
+
+// Trích từ khóa chính từ câu hỏi, build tsquery kiểu OR: "a | b | c"
+// (khớp bất kỳ từ khóa nào, ts_rank tự ưu tiên bài khớp nhiều từ hơn)
+function buildOrTsQuery(text) {
+  const words = text
+    .toLowerCase()
+    .replace(/[^\wà-ỹ\s]/gi, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 2 && !VN_STOPWORDS.has(w));
+
+  const uniqueWords = [...new Set(words)].slice(0, 8);
+  if (uniqueWords.length === 0) return null;
+
+  // Escape ký tự đặc biệt của tsquery (dù đã lọc \W nên hiếm khi cần)
+  return uniqueWords.map(w => w.replace(/['\\]/g, '')).join(' | ');
+}
+
 async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return null;
 
@@ -235,6 +261,15 @@ async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
     return null;
   }
 
+  // Trích từ khóa chính, bỏ từ nối/đệm tiếng Việt phổ biến, rồi build
+  // tsquery kiểu OR ("a | b | c") thay vì để RPC AND toàn bộ câu hỏi
+  // (plainto_tsquery mặc định AND, gần như không khớp câu hỏi tự nhiên dài).
+  const tsQueryText = buildOrTsQuery(cleanQuery);
+  if (!tsQueryText) {
+    console.log('⚠ Không trích được từ khóa hợp lệ, skip forum search');
+    return null;
+  }
+
   try {
     // Dùng RPC search_forum_content() có sẵn trong schema (FTS + ts_rank,
     // dùng GIN index idx_forum_posts_fts / idx_forum_comments_fts) thay vì
@@ -243,7 +278,7 @@ async function searchForumKnowledge(categoryId, queryText, maxResults = 5) {
       method: 'POST',
       headers: getSupabaseHeaders(),
       body: JSON.stringify({
-        search_query: cleanQuery,
+        search_query: tsQueryText,
         p_category_id: categoryId || null,
         p_limit: maxResults
       })
