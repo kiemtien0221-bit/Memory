@@ -1,6 +1,5 @@
 import Groq from 'groq-sdk';
 import { Redis } from '@upstash/redis';
-import axios from 'axios';
 
 let redis = null;
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
@@ -192,7 +191,7 @@ async function matchForumCategory(message, groq, categories) {
       ],
       model: 'openai/gpt-oss-20b',
       temperature: 0,
-      max_tokens: 60,
+      max_tokens: 100,
       response_format: { type: "json_object" },
       reasoning_effort: 'low',
       include_reasoning: false
@@ -452,15 +451,28 @@ async function searchWithRetry(searchFn, name) {
   }
 }
 
+// Helper: fetch với timeout (thay cho axios timeout) + tự parse JSON
+async function fetchJSON(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ============ WEB SEARCH SOURCES ============
 const searchDuckDuckGo = (query) => searchWithRetry(async () => {
-  const response = await axios.get('https://api.duckduckgo.com/', {
-    params: { q: query, format: 'json', no_html: 1, skip_disambig: 1 },
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)' },
-    timeout: 5000
+  const qs = new URLSearchParams({ q: query, format: 'json', no_html: '1', skip_disambig: '1' });
+  const data = await fetchJSON(`https://api.duckduckgo.com/?${qs}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)' }
   });
 
-  const data = response.data;
   if (data.Abstract) {
     return {
       source: 'DuckDuckGo',
@@ -484,23 +496,21 @@ const searchDuckDuckGo = (query) => searchWithRetry(async () => {
 }, 'DuckDuckGo');
 
 const searchWikipedia = (query) => searchWithRetry(async () => {
-  const searchResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
-    params: { action: 'query', list: 'search', srsearch: query, srlimit: 1, format: 'json', origin: '*' },
-    headers: { 'User-Agent': 'KamiApp/1.0' },
-    timeout: 5000
+  const searchQs = new URLSearchParams({ action: 'query', list: 'search', srsearch: query, srlimit: '1', format: 'json', origin: '*' });
+  const searchData = await fetchJSON(`https://vi.wikipedia.org/w/api.php?${searchQs}`, {
+    headers: { 'User-Agent': 'KamiApp/1.0' }
   });
 
-  const results = searchResp.data?.query?.search;
+  const results = searchData?.query?.search;
   if (!results || results.length === 0) return null;
 
   const title = results[0].title;
-  const extractResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
-    params: { action: 'query', prop: 'extracts', titles: title, exintro: true, explaintext: true, exsectionformat: 'plain', format: 'json', origin: '*' },
-    headers: { 'User-Agent': 'KamiApp/1.0' },
-    timeout: 5000
+  const extractQs = new URLSearchParams({ action: 'query', prop: 'extracts', titles: title, exintro: 'true', explaintext: 'true', exsectionformat: 'plain', format: 'json', origin: '*' });
+  const extractData = await fetchJSON(`https://vi.wikipedia.org/w/api.php?${extractQs}`, {
+    headers: { 'User-Agent': 'KamiApp/1.0' }
   });
 
-  const pages = extractResp.data?.query?.pages;
+  const pages = extractData?.query?.pages;
   if (!pages) return null;
   const page = Object.values(pages)[0];
   if (!page?.extract) return null;
@@ -519,14 +529,13 @@ const searchWikipedia = (query) => searchWithRetry(async () => {
 const searchSerper = (query) => {
   if (!SERPER_API_KEY) return null;
   return searchWithRetry(async () => {
-    const response = await axios.post('https://google.serper.dev/search', {
-      q: query, gl: 'vn', hl: 'vi', num: 3
-    }, {
+    const data = await fetchJSON('https://google.serper.dev/search', {
+      method: 'POST',
       headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      timeout: 5000
+      body: JSON.stringify({ q: query, gl: 'vn', hl: 'vi', num: 3 })
     });
 
-    const results = response.data.organic || [];
+    const results = data.organic || [];
     if (results.length === 0) return null;
 
     return {
@@ -539,11 +548,12 @@ const searchSerper = (query) => {
 const searchTavily = (query) => {
   if (!TAVILY_API_KEY) return null;
   return searchWithRetry(async () => {
-    const response = await axios.post('https://api.tavily.com/search', {
-      api_key: TAVILY_API_KEY, query: query, search_depth: 'basic', include_answer: true, max_results: 3
-    }, { timeout: 5000 });
+    const data = await fetchJSON('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query: query, search_depth: 'basic', include_answer: true, max_results: 3 })
+    });
 
-    const data = response.data;
     return {
       source: 'Tavily',
       content: data.answer,
@@ -684,7 +694,7 @@ async function shouldSearch(message, groq) {
       ],
       model: 'openai/gpt-oss-20b',
       temperature: 0,
-      max_tokens: 50,
+      max_tokens: 100,
       response_format: { type: "json_object" },
       reasoning_effort: 'low',
       include_reasoning: false
