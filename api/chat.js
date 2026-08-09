@@ -98,13 +98,6 @@ const MEMORY_CONFIG = {
   MAX_MESSAGES: 1000,
   SUMMARY_CONTEXT_LIMIT: 15
 };
-
-// Whitelist mimeType hợp lệ cho vision
-const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-
-// Pattern "giá" đứng một mình quá rộng → false positive với "giá trị", "đánh giá"...
-// Chỉ match cụm từ đầy đủ, không match "giá" đơn.
-// Xóa "đang" khỏi current vì match gần như mọi câu tiến hành ngữ → false positive.
 const DETECTION_PATTERNS = {
   never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)$/i,
   explicit: /(tìm kiếm|search|tra cứu|google|tìm đi|tìm lại|tìm giúp|tra giúp)/i,
@@ -129,10 +122,6 @@ function normalizeForCache(message) {
     .replace(/\s+/g, ' ')
     .substring(0, 200);
 }
-
-// Stopword tiếng Việt cơ bản — loại từ nối/hư từ trước khi đưa vào to_tsquery,
-// để tránh query kiểu "là | và | của | tổng | thống | mỹ" làm loãng kết quả
-// (những từ này match gần như MỌI bài viết, kéo rank của từ khóa thật xuống).
 const VI_STOPWORDS = new Set([
   'là', 'gì', 'và', 'của', 'các', 'có', 'được', 'cho', 'về', 'này', 'đó',
   'khi', 'thì', 'mà', 'như', 'để', 'với', 'từ', 'trong', 'ngoài', 'trên',
@@ -399,14 +388,8 @@ const searchDuckDuckGo = (query) => searchWithRetry(async () => {
       };
     }
   }
-
   return null;
 }, 'DuckDuckGo');
-
-// 2. Wikipedia tiếng Việt — free, không key
-//    Mạnh với: khái niệm, lịch sử, nhân vật, khoa học, địa lý, văn hóa
-//    Yếu với: tin tức thời sự, sự kiện mới, giá cả
-//    Bổ trợ DDG: DDG miss → Wikipedia thường có bài đầy đủ hơn
 const searchWikipedia = (query) => searchWithRetry(async () => {
   // Bước 1: Tìm title bài phù hợp nhất
   const searchResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
@@ -497,9 +480,6 @@ const searchSerper = (query) => {
     };
   }, 'Serper');
 };
-
-// 4. Tavily — có key, AI-optimized search
-//    Mạnh với: câu hỏi phức tạp, cần tổng hợp nhiều nguồn
 const searchTavily = (query) => {
   if (!TAVILY_API_KEY) return null;
 
@@ -526,24 +506,17 @@ const searchTavily = (query) => {
     };
   }, 'Tavily');
 };
-
-// ============ END SEARCH SOURCES ============
-
 function quickDetect(message) {
   const lower = message.toLowerCase().trim();
-
   if (DETECTION_PATTERNS.never.test(lower)) {
     return { needsSearch: false, confidence: 1.0, reason: 'casual' };
   }
-
   if (DETECTION_PATTERNS.explicit.test(lower)) {
     return { needsSearch: true, confidence: 1.0, type: 'search' };
   }
-
   if (DETECTION_PATTERNS.realtime.test(lower)) {
     return { needsSearch: true, confidence: 1.0, type: 'realtime' };
   }
-
   if (DETECTION_PATTERNS.current.test(lower)) {
     return { needsSearch: true, confidence: 0.9, type: 'knowledge' };
   }
@@ -775,6 +748,25 @@ async function saveSummaries(userId, conversationId, summaries) {
 
 async function createNewSummary(groq, messages, summaryNumber) {
   try {
+    // messages luôn là 1 lô 40 tin (MEMORY_CONFIG.SUMMARY_THRESHOLD) nhét thẳng
+    // vào prompt qua JSON.stringify, không qua truncateMessagesToFit như các lệnh
+    // gọi khác. Nếu 40 tin đó đủ dài (câu trả lời AI dài), tổng token dễ vượt xa
+    // trần 8000 TPM của Groq -> lỗi 413 "Request too large". Cắt bớt tin CŨ NHẤT
+    // trong lô trước khi tóm tắt: vẫn giữ được phần gần nhất, quan trọng hơn cho
+    // mạch hội thoại, chỉ mất phần xa nhất của riêng đợt 40 tin này.
+    const SUMMARY_TPM_BUDGET = 6000; // chừa dư cho system prompt + max_tokens output
+    let trimmedMessages = messages;
+    let payload = JSON.stringify(trimmedMessages);
+
+    while (trimmedMessages.length > 1 && estimateTokens(payload) > SUMMARY_TPM_BUDGET) {
+      trimmedMessages = trimmedMessages.slice(1);
+      payload = JSON.stringify(trimmedMessages);
+    }
+
+    if (trimmedMessages.length < messages.length) {
+      console.warn(`⚠ Summary ${summaryNumber}: cắt bớt ${messages.length - trimmedMessages.length}/${messages.length} tin cũ nhất để vừa TPM budget`);
+    }
+
     const chatCompletion = await groq.chat.completions.create({
       messages: [
         {
@@ -783,7 +775,7 @@ async function createNewSummary(groq, messages, summaryNumber) {
         },
         {
           role: 'user',
-          content: `Tóm tắt phần ${summaryNumber}:\n${JSON.stringify(messages)}`
+          content: `Tóm tắt phần ${summaryNumber}:\n${payload}`
         }
       ],
       model: 'openai/gpt-oss-20b',
