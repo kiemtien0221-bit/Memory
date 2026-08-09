@@ -949,34 +949,6 @@ function shrinkMessages(messages) {
   return systemMsg ? [systemMsg, ...shrunk] : shrunk;
 }
 
-// Lọc cứng cú pháp Markdown/HTML còn sót lại, phòng khi model không tuân
-// theo prompt (nguyên tắc 7-9). Đảm bảo app hiển thị text sạch 100%.
-function stripMarkdown(text) {
-  if (!text) return text;
-  let out = text;
-
-  // Dòng phân cách bảng |---|---| -> bỏ hẳn (chỉ khoảng trắng ngang, KHÔNG ăn \n)
-  out = out.replace(/^[ \t]*\|?[ \t:-]*-{2,}[ \t:|-]*\|?[ \t]*$/gm, '');
-  // Dòng bảng "| a | b | c |" -> "a - b - c"
-  out = out.replace(/^[ \t]*\|(.+)\|[ \t]*$/gm, (_, inner) =>
-    inner.split('|').map(s => s.trim()).filter(Boolean).join(' - ')
-  );
-  // Heading #, ##, ###
-  out = out.replace(/^#{1,6}[ \t]*/gm, '');
-  // Bold/italic **text** / *text*
-  out = out.replace(/\*\*(.+?)\*\*/g, '$1');
-  out = out.replace(/(^|[^*])\*(?!\*)([^*]+?)\*(?!\*)/g, '$1$2');
-  // <br> -> xuống dòng
-  out = out.replace(/<br\s*\/?>/gi, '\n');
-  // Link markdown [text](url) -> text (url)
-  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-  // Gộp dòng trống thừa
-  out = out.replace(/\n{3,}/g, '\n\n');
-  out = out.replace(/\n[ \t]*\n/g, '\n');
-
-  return out.trim();
-}
-
 async function callGroqWithRetry(userId, messages) {
   let currentKeyIndex = await getUserKeyIndex(userId);
   let attempts = 0;
@@ -993,7 +965,7 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 2000,
+        max_tokens: 1200,
         top_p: 0.9,
         stream: false,
         reasoning_effort: 'low',
@@ -1458,10 +1430,7 @@ ${citationInstruction}
 3. ƯU TIÊN #3: Kiến thức nội tại của AI (chỉ dùng khi không có nguồn khác)
 4. KHÔNG BỊA ĐẶT - nếu không chắc thì nói thẳng
 5. Giải thích bản chất trước, chi tiết sau. Mạch lạc, có cấu trúc.
-6. Trả lời bằng tiếng Việt.
-7. TUYỆT ĐỐI KHÔNG dùng cú pháp Markdown hay HTML (không **, không ##/###, không bảng dạng |---|---|, không <br>, không [text](link)). Ứng dụng hiển thị văn bản thuần, mọi ký hiệu này sẽ hiện nguyên xi gây rối mắt.
-8. Muốn liệt kê thì dùng gạch đầu dòng "-" hoặc số thứ tự "1." bình thường trên dòng riêng, không in đậm.
-9. Muốn so sánh/liệt kê nhiều mục (như tiểu sử, thông số) thì trình bày thành các dòng "Nhãn: Giá trị", không dùng bảng.`
+6. Trả lời bằng tiếng Việt.`
     };
 
     let messages = [systemPrompt, ...workingMemory];
@@ -1471,7 +1440,7 @@ ${citationInstruction}
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
 
-    const assistantMessage = stripMarkdown(chatCompletion.choices[0]?.message?.content || 'Không có phản hồi');
+    const assistantMessage = chatCompletion.choices[0]?.message?.content || 'Không có phản hồi';
 
     console.log(`✅ AI responded`);
 
