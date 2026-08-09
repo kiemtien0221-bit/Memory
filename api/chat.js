@@ -1017,7 +1017,10 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 1200, // đồng bộ với reserveTokens ở truncateMessagesToFit
+        max_tokens: 2000, // tăng từ 1200 -> 2000 để câu trả lời dài không bị cắt giữa chừng.
+                           // Phải đồng bộ với reserveTokens ở lời gọi truncateMessagesToFit
+                           // (dòng ~1529) — nếu chỉ sửa số ở đây mà không sửa reserveTokens,
+                           // input sẽ ăn lấn vào ngân sách dành cho output.
         top_p: 0.9,
         stream: false,
         reasoning_effort: 'low',   // giảm token dùng cho suy nghĩ nội bộ -> đỡ tốn TPM, nhanh hơn
@@ -1523,10 +1526,11 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
     let messages = [systemPrompt, ...workingMemory];
     // TPM thật của tài khoản free là 8000, nhưng estimateTokens chỉ là ước lượng
     // (không phải tokenizer thật) nên luôn chừa buffer an toàn ~700 token.
-    // reserveTokens giảm 2048 -> 1200: vẫn đủ cho câu trả lời, đỡ tốn token,
-    // và để dư chỗ cho phần input khi có search result/summary dài.
+    // reserveTokens tăng 1200 -> 2000, khớp với max_tokens ở callGroqWithRetry,
+    // để câu trả lời dài không bị cắt giữa chừng. Input (system+history+search)
+    // còn lại (8000-700)-2000 = 5300 token, vẫn đủ rộng rãi cho hầu hết trường hợp.
     const TPM_SAFETY_BUFFER = 700;
-    messages = truncateMessagesToFit(messages, 8000 - TPM_SAFETY_BUFFER, 1200);
+    messages = truncateMessagesToFit(messages, 8000 - TPM_SAFETY_BUFFER, 2000);
     console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
