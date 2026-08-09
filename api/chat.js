@@ -130,6 +130,41 @@ function normalizeForCache(message) {
     .substring(0, 200);
 }
 
+// Stopword tiếng Việt cơ bản — loại từ nối/hư từ trước khi đưa vào to_tsquery,
+// để tránh query kiểu "là | và | của | tổng | thống | mỹ" làm loãng kết quả
+// (những từ này match gần như MỌI bài viết, kéo rank của từ khóa thật xuống).
+const VI_STOPWORDS = new Set([
+  'là', 'gì', 'và', 'của', 'các', 'có', 'được', 'cho', 'về', 'này', 'đó',
+  'khi', 'thì', 'mà', 'như', 'để', 'với', 'từ', 'trong', 'ngoài', 'trên',
+  'dưới', 'sao', 'sao vậy', 'nên', 'hay', 'hoặc', 'nếu', 'vì', 'do', 'bị',
+  'sẽ', 'đã', 'đang', 'rồi', 'nào', 'ai', 'bạn', 'tôi', 'mình', 'ơi',
+  'à', 'ạ', 'nhé', 'nha', 'vậy', 'thế', 'không', 'chưa', 'hãy', 'hãy giúp',
+  'giúp', 'giùm', 'cho tôi', 'cho mình', 'làm', 'một', 'những', 'lại'
+]);
+
+// to_tsquery không tự tách câu như plainto_tsquery — cần tự trích từ khóa
+// và nối bằng toán tử OR (|) để search_forum_content() tìm được bài chỉ
+// chứa MỘT PHẦN từ khóa trong câu hỏi (thay vì AND hết toàn bộ câu, gần
+// như luôn miss với câu hỏi tự nhiên dài).
+function extractSearchKeywords(message, maxKeywords = 6) {
+  const words = message
+    .toLowerCase()
+    .replace(/[.,!?;:'"()]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length >= 2 && !VI_STOPWORDS.has(w));
+
+  // Loại trùng, giữ thứ tự xuất hiện
+  const unique = [...new Set(words)].slice(0, maxKeywords);
+
+  // to_tsquery cấm ký tự đặc biệt ngoài chữ/số — escape để không lỗi cú pháp
+  const safe = unique
+    .map(w => w.replace(/[^\p{L}\p{N}_]/gu, ''))
+    .filter(w => w.length >= 2);
+
+  return safe.join(' | ');
+}
+
 // Chuẩn hóa kết quả search về 1 format thống nhất để tránh AI hiểu sai cấu trúc.
 function normalizeSearchResult(raw) {
   if (!raw) return null;
@@ -295,6 +330,35 @@ async function searchWithRetry(searchFn, name) {
 }
 
 // ============ SEARCH SOURCES ============
+
+const KAMI_FORUM_API = 'https://memory-orpin-two.vercel.app/api/forum';
+
+// 0. Kami Forum — nguồn nội bộ, thử trước web ngoài vì là kiến thức cộng
+//    đồng đã qua kiểm duyệt (status='approved'). Dùng RPC search_forum_content
+//    (full-text search Postgres qua to_tsquery), KHÔNG dùng action=search cũ
+//    (ilike substring) vì ilike chỉ khớp khi từ khóa xuất hiện y hệt trong
+//    bài viết — gần như luôn miss với câu hỏi diễn đạt khác từ vựng.
+const searchKamiForum = (query) => searchWithRetry(async () => {
+  const keywords = extractSearchKeywords(query);
+  if (!keywords) return null; // câu hỏi toàn stopword, không có gì để tìm
+
+  const response = await axios.get(KAMI_FORUM_API, {
+    params: { action: 'searchFts', q: keywords, limit: 3 },
+    timeout: 5000
+  });
+
+  const rows = response.data?.results;
+  if (!rows || rows.length === 0) return null;
+
+  return {
+    source: 'KamiForum',
+    results: rows.map(r => ({
+      title: r.title,
+      content: (r.content || '').substring(0, 500),
+      url: `kamiforum://post/${r.id}`
+    }))
+  };
+}, 'KamiForum');
 
 // 1. DuckDuckGo Instant Answer — free, không key
 //    Mạnh với: câu hỏi 1 đáp án rõ (thủ đô, định nghĩa ngắn, knowledge panel)
@@ -567,6 +631,17 @@ async function smartSearch(query, searchType) {
   const isRealtime = searchType === 'realtime';
 
   if (!isRealtime) {
+    // 0. Kami Forum — kiến thức nội bộ đã duyệt, ưu tiên trước web ngoài
+    console.log(`🔍 Trying KamiForum...`);
+    result = await searchKamiForum(query);
+    if (result) {
+      console.log(`✅ KamiForum success`);
+      const normalized = normalizeSearchResult(result);
+      searchCache.set(cacheKey, normalized);
+      return normalized;
+    }
+    console.log(`❌ KamiForum failed`);
+
     // 1. DuckDuckGo — free, nhanh, tốt cho knowledge panel
     console.log(`🔍 Trying DuckDuckGo...`);
     result = await searchDuckDuckGo(query);
@@ -1334,6 +1409,26 @@ export default async function handler(req, res) {
       searchDecision = quickDetect(message);
       console.log(`⚡ Quick detection: ${searchDecision.needsSearch ? 'SEARCH' : 'SKIP'} (confidence: ${searchDecision.confidence})`);
 
+      // confidence thấp → quickDetect (regex) không đủ tin cậy, hỏi AI ngay trong
+      // request này để quyết định đúng cho CHÍNH câu hỏi hiện tại, thay vì đoán
+      // "SKIP" và bỏ lỡ search cần thiết. Trước đây việc này chạy nền (không await)
+      // để dành cho request sau, nhưng: (1) key cache theo nội dung câu hỏi đã
+      // chuẩn hóa sơ sài nên hầu như không hit giữa các câu hỏi diễn đạt khác nhau,
+      // (2) trên serverless, promise không await có thể bị runtime cắt ngang trước
+      // khi kịp ghi cache — tốn lượt gọi Groq mà không thu được gì. Gọi đồng bộ ở
+      // đây tốn thêm một lần gọi model nhỏ (20b, max_tokens 50) nhưng đảm bảo có
+      // tác dụng thật cho lượt hỏi đang xử lý.
+      if (searchDecision.confidence < 0.8) {
+        try {
+          searchDecision = await callTempGroqWithRetry(userId, async (groq) => {
+            return shouldSearch(message, groq);
+          });
+          console.log(`🤖 AI detection: ${searchDecision.needsSearch ? 'SEARCH' : 'SKIP'}`);
+        } catch (err) {
+          console.error('AI detection failed, fallback to quickDetect result:', err.message);
+        }
+      }
+
       if (searchDecision.confidence >= 0.8) {
         detectionCache.set(searchCacheKey, searchDecision);
       }
@@ -1344,24 +1439,6 @@ export default async function handler(req, res) {
       if (searchResult) {
         console.log(`✅ Search successful: ${searchResult.source}`);
       }
-    }
-
-    if (!cachedDecision && searchDecision.confidence < 0.8) {
-      // Background: AI detection + prefetch search cho lần sau
-      // (kết quả sẽ được cache, không dùng cho response này)
-      callTempGroqWithRetry(userId, async (groq) => {
-        const aiDecision = await shouldSearch(message, groq);
-        detectionCache.set(searchCacheKey, aiDecision);
-
-        if (aiDecision.needsSearch && !searchResult) {
-          const bgResult = await smartSearch(message, aiDecision.type);
-          if (bgResult) {
-            console.log(`✅ Background search cached for next request: ${bgResult.source}`);
-          }
-        }
-
-        return aiDecision;
-      }).catch(err => console.error('Background detection error:', err));
     }
 
     conversationHistory.push({

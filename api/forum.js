@@ -132,7 +132,7 @@ export default async function handler(req, res) {
         });
       }
 
-      // ── Search ──
+      // ── Search (ilike substring) — dùng bởi UI forum, giữ nguyên hành vi cũ ──
       if (action === 'search') {
         if (!q || !q.trim()) {
           return res.status(400).json({ success: false, error: 'Thiếu từ khóa' });
@@ -144,6 +144,33 @@ export default async function handler(req, res) {
         );
         if (!r.ok) throw new Error(await r.text());
         return res.status(200).json({ success: true, posts: await r.json() });
+      }
+
+      // ── Search full-text (dùng bởi chat.js để lấy kiến thức forum cho AI) ──
+      // q phải là chuỗi từ khóa dạng OR đã tách sẵn ("từ1 | từ2 | từ3"),
+      // KHÔNG phải nguyên câu hỏi — xem search_forum_content() trong SQL.
+      if (action === 'searchFts') {
+        if (!q || !q.trim()) {
+          return res.status(400).json({ success: false, error: 'Thiếu từ khóa' });
+        }
+        const lim = Math.min(10, Math.max(1, parseInt(req.query.limit) || 5));
+
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/search_forum_content`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            search_query: q.trim(),
+            p_category_id: category_id ? parseInt(category_id) : null,
+            p_limit: lim
+          })
+        });
+
+        if (!r.ok) {
+          console.error('searchFts RPC error:', await r.text());
+          return res.status(500).json({ success: false, error: 'Lỗi tìm kiếm full-text' });
+        }
+
+        return res.status(200).json({ success: true, results: await r.json() });
       }
 
       // ── Admin: lấy tất cả bài ──
