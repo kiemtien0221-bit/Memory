@@ -591,7 +591,11 @@ async function shouldSearch(message, groq) {
       ],
       model: 'openai/gpt-oss-20b',
       temperature: 0,
-      max_tokens: 50,
+      // 50 quá ít cho model reasoning: dù reasoning_effort='low', model vẫn tốn
+      // một phần token cho suy nghĩ nội bộ trước khi xuất JSON. Khi ngân sách
+      // cạn giữa chừng, Groq trả lỗi "json_validate_failed" với failed_generation
+      // rỗng thay vì JSON cụt. 150 đủ dư cho cả suy nghĩ ngắn + JSON output.
+      max_tokens: 150,
       response_format: { type: "json_object" },
       reasoning_effort: 'low',
       include_reasoning: false // gpt-oss không hỗ trợ reasoning_format, dùng include_reasoning
