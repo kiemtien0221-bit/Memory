@@ -949,6 +949,34 @@ function shrinkMessages(messages) {
   return systemMsg ? [systemMsg, ...shrunk] : shrunk;
 }
 
+// Lọc cứng cú pháp Markdown/HTML còn sót lại, phòng khi model không tuân
+// theo prompt (nguyên tắc 7-9). Đảm bảo app hiển thị text sạch 100%.
+function stripMarkdown(text) {
+  if (!text) return text;
+  let out = text;
+
+  // Dòng phân cách bảng |---|---| -> bỏ hẳn (chỉ khoảng trắng ngang, KHÔNG ăn \n)
+  out = out.replace(/^[ \t]*\|?[ \t:-]*-{2,}[ \t:|-]*\|?[ \t]*$/gm, '');
+  // Dòng bảng "| a | b | c |" -> "a - b - c"
+  out = out.replace(/^[ \t]*\|(.+)\|[ \t]*$/gm, (_, inner) =>
+    inner.split('|').map(s => s.trim()).filter(Boolean).join(' - ')
+  );
+  // Heading #, ##, ###
+  out = out.replace(/^#{1,6}[ \t]*/gm, '');
+  // Bold/italic **text** / *text*
+  out = out.replace(/\*\*(.+?)\*\*/g, '$1');
+  out = out.replace(/(^|[^*])\*(?!\*)([^*]+?)\*(?!\*)/g, '$1$2');
+  // <br> -> xuống dòng
+  out = out.replace(/<br\s*\/?>/gi, '\n');
+  // Link markdown [text](url) -> text (url)
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+  // Gộp dòng trống thừa
+  out = out.replace(/\n{3,}/g, '\n\n');
+  out = out.replace(/\n[ \t]*\n/g, '\n');
+
+  return out.trim();
+}
+
 async function callGroqWithRetry(userId, messages) {
   let currentKeyIndex = await getUserKeyIndex(userId);
   let attempts = 0;
@@ -965,7 +993,7 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 1200,
+        max_tokens: 2000,
         top_p: 0.9,
         stream: false,
         reasoning_effort: 'low',
@@ -1443,7 +1471,7 @@ ${citationInstruction}
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
 
-    const assistantMessage = chatCompletion.choices[0]?.message?.content || 'Không có phản hồi';
+    const assistantMessage = stripMarkdown(chatCompletion.choices[0]?.message?.content || 'Không có phản hồi');
 
     console.log(`✅ AI responded`);
 
