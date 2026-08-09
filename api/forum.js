@@ -442,12 +442,15 @@ async function handleUpdate(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
 }
 
 async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
-  const { name, icon, sort_order, view_mode, description, keywords } = body;
+  const { name, icon, sort_order, view_mode, description } = body;
   const auth = verifyAdmin(body, ADMIN_KEY);
   if (!auth.ok) return res.status(403).json({ success: false, error: auth.error });
 
   if (!name?.trim()) return res.status(400).json({ success: false, error: 'Thiếu tên danh mục' });
 
+  // Cột keywords còn tồn tại trong DB nhưng không dùng ở đâu trong luồng search
+  // (search_forum_content dùng full-text trên title/content, không đọc keywords).
+  // Không cho nhập qua UI admin nữa để tránh hiểu lầm là nó ảnh hưởng search AI.
   const r = await fetch(`${SUPABASE_URL}/rest/v1/forum_categories`, {
     method: 'POST',
     headers: { ...headers, Prefer: 'return=minimal' },
@@ -456,8 +459,7 @@ async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
       icon: icon || '📁',
       sort_order: sort_order || 0,
       view_mode: view_mode || 'list',
-      description: description || '',
-      keywords: keywords || name.trim()
+      description: description || ''
     })
   });
 
@@ -466,7 +468,7 @@ async function handleAddCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
 }
 
 async function handleEditCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
-  const { id, name, icon, sort_order, view_mode, description, keywords } = body;
+  const { id, name, icon, sort_order, view_mode, description } = body;
   const auth = verifyAdmin(body, ADMIN_KEY);
   if (!auth.ok) return res.status(403).json({ success: false, error: auth.error });
 
@@ -478,7 +480,6 @@ async function handleEditCategory(body, ADMIN_KEY, SUPABASE_URL, headers, res) {
   if (sort_order !== undefined) updateData.sort_order = sort_order;
   if (view_mode !== undefined) updateData.view_mode = view_mode;
   if (description !== undefined) updateData.description = description;
-  if (keywords !== undefined) updateData.keywords = keywords;
 
   if (Object.keys(updateData).length === 0) {
     return res.status(400).json({ success: false, error: 'Không có dữ liệu cập nhật' });
