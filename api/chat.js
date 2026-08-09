@@ -145,13 +145,21 @@ async function fetchForumCategories() {
 
 function buildCategoryKeywordMap(categories) {
   const map = {};
+  // \b của JS trong template literal (backtick) bị hiểu thành ký tự
+  // backspace (U+0008), KHÔNG phải 2 ký tự "\b" -> regex cũ gần như
+  // không bao giờ khớp. Dùng lookaround thủ công, hỗ trợ cả ký tự có
+  // dấu tiếng Việt (mà \w gốc cũng không nhận diện được).
+  const VN_WORD = 'a-zA-Z0-9à-ỹÀ-Ỹ';
   for (const cat of categories) {
     const keywords = cat.keywords || cat.name;
     const patterns = keywords.split(',').map(k => k.trim()).filter(k => k.length > 0);
     if (patterns.length > 0) {
       map[cat.id] = {
         ...cat,
-        patterns: patterns.map(p => new RegExp(`\b${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\b`, 'i'))
+        patterns: patterns.map(p => new RegExp(
+          `(?<![${VN_WORD}])${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![${VN_WORD}])`,
+          'i'
+        ))
       };
     }
   }
@@ -460,7 +468,13 @@ async function fetchJSON(url, options = {}, timeoutMs = 5000) {
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
     }
-    return await res.json();
+    const text = await res.text();
+    if (!text) return null; // Body rỗng (DuckDuckGo hay trả rỗng khi không có Instant Answer)
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error(`Invalid JSON: ${text.slice(0, 100)}`);
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -472,6 +486,7 @@ const searchDuckDuckGo = (query) => searchWithRetry(async () => {
   const data = await fetchJSON(`https://api.duckduckgo.com/?${qs}`, {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)' }
   });
+  if (!data) return null; // Body rỗng - DDG không có Instant Answer cho query này
 
   if (data.Abstract) {
     return {
@@ -535,7 +550,7 @@ const searchSerper = (query) => {
       body: JSON.stringify({ q: query, gl: 'vn', hl: 'vi', num: 3 })
     });
 
-    const results = data.organic || [];
+    const results = data?.organic || [];
     if (results.length === 0) return null;
 
     return {
@@ -554,6 +569,7 @@ const searchTavily = (query) => {
       body: JSON.stringify({ api_key: TAVILY_API_KEY, query: query, search_depth: 'basic', include_answer: true, max_results: 3 })
     });
 
+    if (!data) return null;
     return {
       source: 'Tavily',
       content: data.answer,
