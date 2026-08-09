@@ -1430,7 +1430,10 @@ ${citationInstruction}
 3. ƯU TIÊN #3: Kiến thức nội tại của AI (chỉ dùng khi không có nguồn khác)
 4. KHÔNG BỊA ĐẶT - nếu không chắc thì nói thẳng
 5. Giải thích bản chất trước, chi tiết sau. Mạch lạc, có cấu trúc.
-6. Trả lời bằng tiếng Việt.`
+6. Trả lời bằng tiếng Việt.
+7. TUYỆT ĐỐI KHÔNG dùng cú pháp Markdown hay HTML (không **, không ##/###, không bảng dạng |---|---|, không <br>, không [text](link)). Ứng dụng hiển thị văn bản thuần, mọi ký hiệu này sẽ hiện nguyên xi gây rối mắt.
+8. Muốn liệt kê thì dùng gạch đầu dòng "-" hoặc số thứ tự "1." bình thường trên dòng riêng, không in đậm.
+9. Muốn so sánh/liệt kê nhiều mục (như tiểu sử, thông số) thì trình bày thành các dòng "Nhãn: Giá trị", không dùng bảng.`
     };
 
     let messages = [systemPrompt, ...workingMemory];
