@@ -98,6 +98,13 @@ const MEMORY_CONFIG = {
   MAX_MESSAGES: 1000,
   SUMMARY_CONTEXT_LIMIT: 15
 };
+
+// Whitelist mimeType hợp lệ cho vision
+const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+// Pattern "giá" đứng một mình quá rộng → false positive với "giá trị", "đánh giá"...
+// Chỉ match cụm từ đầy đủ, không match "giá" đơn.
+// Xóa "đang" khỏi current vì match gần như mọi câu tiến hành ngữ → false positive.
 const DETECTION_PATTERNS = {
   never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)$/i,
   explicit: /(tìm kiếm|search|tra cứu|google|tìm đi|tìm lại|tìm giúp|tra giúp)/i,
@@ -122,6 +129,10 @@ function normalizeForCache(message) {
     .replace(/\s+/g, ' ')
     .substring(0, 200);
 }
+
+// Stopword tiếng Việt cơ bản — loại từ nối/hư từ trước khi đưa vào to_tsquery,
+// để tránh query kiểu "là | và | của | tổng | thống | mỹ" làm loãng kết quả
+// (những từ này match gần như MỌI bài viết, kéo rank của từ khóa thật xuống).
 const VI_STOPWORDS = new Set([
   'là', 'gì', 'và', 'của', 'các', 'có', 'được', 'cho', 'về', 'này', 'đó',
   'khi', 'thì', 'mà', 'như', 'để', 'với', 'từ', 'trong', 'ngoài', 'trên',
@@ -388,8 +399,14 @@ const searchDuckDuckGo = (query) => searchWithRetry(async () => {
       };
     }
   }
+
   return null;
 }, 'DuckDuckGo');
+
+// 2. Wikipedia tiếng Việt — free, không key
+//    Mạnh với: khái niệm, lịch sử, nhân vật, khoa học, địa lý, văn hóa
+//    Yếu với: tin tức thời sự, sự kiện mới, giá cả
+//    Bổ trợ DDG: DDG miss → Wikipedia thường có bài đầy đủ hơn
 const searchWikipedia = (query) => searchWithRetry(async () => {
   // Bước 1: Tìm title bài phù hợp nhất
   const searchResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
@@ -480,6 +497,9 @@ const searchSerper = (query) => {
     };
   }, 'Serper');
 };
+
+// 4. Tavily — có key, AI-optimized search
+//    Mạnh với: câu hỏi phức tạp, cần tổng hợp nhiều nguồn
 const searchTavily = (query) => {
   if (!TAVILY_API_KEY) return null;
 
@@ -506,17 +526,24 @@ const searchTavily = (query) => {
     };
   }, 'Tavily');
 };
+
+// ============ END SEARCH SOURCES ============
+
 function quickDetect(message) {
   const lower = message.toLowerCase().trim();
+
   if (DETECTION_PATTERNS.never.test(lower)) {
     return { needsSearch: false, confidence: 1.0, reason: 'casual' };
   }
+
   if (DETECTION_PATTERNS.explicit.test(lower)) {
     return { needsSearch: true, confidence: 1.0, type: 'search' };
   }
+
   if (DETECTION_PATTERNS.realtime.test(lower)) {
     return { needsSearch: true, confidence: 1.0, type: 'realtime' };
   }
+
   if (DETECTION_PATTERNS.current.test(lower)) {
     return { needsSearch: true, confidence: 0.9, type: 'knowledge' };
   }
@@ -608,23 +635,33 @@ async function smartSearch(query, searchType) {
   const isRealtime = searchType === 'realtime';
 
   if (!isRealtime) {
-    // 0. Kami Forum — kiến thức nội bộ đã duyệt, ưu tiên trước web ngoài
-    console.log(`🔍 Trying KamiForum...`);
-    result = await searchKamiForum(query);
-    if (result) {
-      console.log(`✅ KamiForum success`);
-      const normalized = normalizeSearchResult(result);
+    // 0+1. Kami Forum + DuckDuckGo chạy SONG SONG thay vì tuần tự.
+    // Trước đây forum chạy await riêng trước DDG: nếu forum không có bài liên quan
+    // (phổ biến hơn, vì forum ít bài hơn cả internet), thời gian gọi forum (~100-400ms)
+    // cộng dồn vào tổng response time cho MỌI câu hỏi cần search, dù cuối cùng vẫn
+    // phải đi DDG. Chạy song song: tổng thời gian chờ = max(forum, DDG) thay vì
+    // forum + DDG. Vẫn ưu tiên forum nếu nó có kết quả, để giữ đúng nguyên tắc
+    // "kiến thức nội bộ đã duyệt ưu tiên hơn web ngoài".
+    console.log(`🔍 Trying KamiForum + DuckDuckGo (song song)...`);
+    const [forumResult, ddgResult] = await Promise.allSettled([
+      searchKamiForum(query),
+      searchDuckDuckGo(query)
+    ]);
+
+    const forumValue = forumResult.status === 'fulfilled' ? forumResult.value : null;
+    const ddgValue = ddgResult.status === 'fulfilled' ? ddgResult.value : null;
+
+    if (forumValue) {
+      console.log(`✅ KamiForum success (song song)`);
+      const normalized = normalizeSearchResult(forumValue);
       searchCache.set(cacheKey, normalized);
       return normalized;
     }
-    console.log(`❌ KamiForum failed`);
+    console.log(`❌ KamiForum failed (song song)`);
 
-    // 1. DuckDuckGo — free, nhanh, tốt cho knowledge panel
-    console.log(`🔍 Trying DuckDuckGo...`);
-    result = await searchDuckDuckGo(query);
-    if (result) {
-      console.log(`✅ DuckDuckGo success`);
-      const normalized = normalizeSearchResult(result);
+    if (ddgValue) {
+      console.log(`✅ DuckDuckGo success (song song)`);
+      const normalized = normalizeSearchResult(ddgValue);
       searchCache.set(cacheKey, normalized);
       return normalized;
     }
@@ -995,6 +1032,78 @@ function shrinkMessages(messages) {
   const keep = Math.max(1, Math.ceil(rest.length / 2));
   const shrunk = rest.slice(-keep);
   return systemMsg ? [systemMsg, ...shrunk] : shrunk;
+}
+
+// callGroqStream: viết riêng cho luồng trả lời chính, KHÔNG dùng chung với
+// callGroqWithRetry (giữ callGroqWithRetry non-stream nguyên vẹn cho các lệnh
+// gọi phụ như detection/summary/extract — không cần trải nghiệm gõ chữ, và
+// logic shrink/retry ở đó vẫn cần response đầy đủ để bắt lỗi 413/429 an toàn).
+//
+// Lỗi 413 (quá lớn) và 429 (hết quota) từ Groq LUÔN xảy ra ngay khi gửi request,
+// TRƯỚC KHI model sinh token nào — nên trong thực tế, nếu stream đã bắt đầu chảy
+// chunk đầu tiên thì coi như request hợp lệ, không cần lo phải "retry giữa chừng".
+// Nếu lỗi xảy ra trước chunk đầu tiên, vẫn shrink/xoay key và thử lại bình thường.
+async function callGroqStream(userId, messages, onChunk) {
+  let currentKeyIndex = await getUserKeyIndex(userId);
+  let attempts = 0;
+  const maxAttempts = API_KEYS.length;
+  let shrinkAttempts = 0;
+  const maxShrinkAttempts = 3;
+
+  while (attempts < maxAttempts) {
+    try {
+      const apiKey = API_KEYS[currentKeyIndex];
+      const groq = new Groq({ apiKey });
+
+      const stream = await groq.chat.completions.create({
+        messages,
+        model: 'openai/gpt-oss-120b',
+        temperature: 0.7,
+        max_tokens: 2000,
+        top_p: 0.9,
+        stream: true,
+        reasoning_effort: 'low',
+        include_reasoning: false
+      });
+
+      let fullText = '';
+      let receivedAnyChunk = false;
+
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta?.content || '';
+        if (delta) {
+          receivedAnyChunk = true;
+          fullText += delta;
+          onChunk(delta);
+        }
+      }
+
+      await setUserKeyIndex(userId, currentKeyIndex);
+      return fullText;
+
+    } catch (error) {
+      // Lỗi xảy ra SAU khi đã stream vài chunk cho client -> không thể retry êm
+      // (client đã hiển thị 1 phần rồi), đành ném lỗi để handler xử lý dừng stream.
+      // Trường hợp này cực hiếm vì 413/429 luôn xảy ra trước chunk đầu tiên.
+      if (isTooLargeError(error) && shrinkAttempts < maxShrinkAttempts && messages.length > 1) {
+        shrinkAttempts++;
+        messages = shrinkMessages(messages);
+        console.log(`⚠ 413 Request too large (stream), cắt bớt messages (lần ${shrinkAttempts}), thử lại cùng key...`);
+        continue;
+      }
+
+      if (isQuotaOrRateError(error) && attempts < maxAttempts - 1) {
+        console.log(`Key ${currentKeyIndex + 1} hết quota (stream), chuyển key...`);
+        currentKeyIndex = getNextKeyIndex(currentKeyIndex);
+        attempts++;
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw new Error('Đã thử hết tất cả API keys');
 }
 
 async function callGroqWithRetry(userId, messages) {
@@ -1529,6 +1638,96 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
     messages = truncateMessagesToFit(messages, 8000 - TPM_SAFETY_BUFFER, 2000);
     console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
 
+    // Client cũ (chưa cập nhật để đọc SSE) không gửi req.body.stream -> giữ nguyên
+    // hành vi JSON 1 cục như trước, không phá vỡ app đang chạy ngoài production.
+    const wantsStream = req.body.stream === true;
+
+    if (wantsStream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no' // tắt buffer ở proxy (nếu có) để chunk chảy ngay, không gom lại
+      });
+
+      let assistantMessage = '';
+      try {
+        assistantMessage = await callGroqStream(userId, messages, (delta) => {
+          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        });
+      } catch (streamError) {
+        console.error('❌ Stream error:', streamError);
+        res.write(`data: ${JSON.stringify({ error: streamError.message || 'Lỗi khi tạo phản hồi' })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+
+      console.log(`✅ AI responded (stream)`);
+
+      conversationHistory.push({ role: 'assistant', content: assistantMessage });
+      await saveShortTermMemory(userId, finalConversationId, conversationHistory);
+      responseCache.set(responseCacheKey, assistantMessage);
+
+      if (await shouldExtractNow(userId, finalConversationId, conversationHistory)) {
+        console.log(`🔍 Background extracting...`);
+        callTempGroqWithRetry(userId, async (groq) => {
+          const newInfo = await extractPersonalInfo(groq, conversationHistory);
+          if (Object.keys(newInfo).length > 0) {
+            const updatedProfile = mergeProfile(userProfile, newInfo);
+            await saveLongTermMemory(userId, updatedProfile);
+            await markExtracted(userId, finalConversationId, conversationHistory);
+            console.log(`✅ Profile updated`);
+          } else {
+            await markExtracted(userId, finalConversationId, conversationHistory);
+          }
+          return newInfo;
+        }).catch(err => console.error('Background extract error:', err));
+      }
+
+      if (redis) {
+        const chatKey = `chat:${userId}:${finalConversationId}`;
+        const ttl = await redis.ttl(chatKey);
+        const daysRemaining = ttl / 86400;
+        if (daysRemaining > 0 && daysRemaining < 2 && conversationHistory.length >= 3) {
+          console.log(`⚠ Safety extract...`);
+          callTempGroqWithRetry(userId, async (groq) => {
+            const newInfo = await extractPersonalInfo(groq, conversationHistory);
+            if (Object.keys(newInfo).length > 0) {
+              const updatedProfile = mergeProfile(userProfile, newInfo);
+              await saveLongTermMemory(userId, updatedProfile);
+              console.log(`✅ Safety profile saved`);
+            }
+            return newInfo;
+          }).catch(err => console.error('Background safety extract error:', err));
+        }
+      }
+
+      const responseTime = Date.now() - startTime;
+      console.log(`⚡ Response time: ${responseTime}ms`);
+
+      // Sự kiện cuối cùng: gửi kèm metadata (giống phần "stats" của bản JSON cũ)
+      // để client có thể cập nhật UI phụ (thời gian phản hồi, nguồn search...)
+      // sau khi text đã hiện xong hết.
+      res.write(`data: ${JSON.stringify({
+        done: true,
+        responseTime,
+        stats: {
+          totalMessages: conversationHistory.length,
+          workingMemorySize: workingMemory.length,
+          summariesCount: summaries.length,
+          summariesInContext: context.contextInfo.summariesInContext,
+          userProfileFields: Object.keys(userProfile).length,
+          storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
+          searchUsed: !!searchResult,
+          searchSource: searchResult?.source || null,
+          modelUsed: 'openai/gpt-oss-120b',
+          cached: false
+        }
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+
     const chatCompletion = await callGroqWithRetry(userId, messages);
 
     const assistantMessage = chatCompletion.choices[0]?.message?.content || 'Không có phản hồi';
@@ -1634,6 +1833,19 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
   } catch (error) {
     console.error('❌ Error:', error);
     console.error('Error stack:', error.stack);
+
+    // Nếu đã writeHead cho SSE (stream), không thể res.status().json() nữa -
+    // header đã gửi, gọi lại sẽ crash với ERR_HTTP_HEADERS_SENT. Đóng stream
+    // bằng 1 sự kiện lỗi thay vì đổi response type giữa chừng.
+    if (res.headersSent) {
+      try {
+        res.write(`data: ${JSON.stringify({ error: error.message || 'Internal server error' })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch (writeErr) {
+        console.error('Failed to write error to stream:', writeErr);
+      }
+      return res.end();
+    }
 
     return res.status(500).json({
       success: false,
