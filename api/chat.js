@@ -636,15 +636,23 @@ async function smartSearch(query, searchType) {
 
   if (!isRealtime) {
     // 0+1. Kami Forum + DuckDuckGo chạy SONG SONG thay vì tuần tự.
-    // Trước đây forum chạy await riêng trước DDG: nếu forum không có bài liên quan
-    // (phổ biến hơn, vì forum ít bài hơn cả internet), thời gian gọi forum (~100-400ms)
-    // cộng dồn vào tổng response time cho MỌI câu hỏi cần search, dù cuối cùng vẫn
-    // phải đi DDG. Chạy song song: tổng thời gian chờ = max(forum, DDG) thay vì
-    // forum + DDG. Vẫn ưu tiên forum nếu nó có kết quả, để giữ đúng nguyên tắc
-    // "kiến thức nội bộ đã duyệt ưu tiên hơn web ngoài".
+    // QUAN TRỌNG: Promise.allSettled chờ CẢ HAI xong, không phải "ai xong trước".
+    // Nếu forum bị treo (lỗi Supabase, RPC chưa deploy...), searchKamiForum còn có
+    // retryWithBackoff bên trong (2 lần thử, mỗi lần timeout 5s + backoff 1s) ->
+    // riêng forum có thể kéo tới ~11s dù DuckDuckGo đã xong từ giây đầu tiên, và
+    // allSettled vẫn đứng chờ đủ 11s đó. Đây là nguyên nhân response time tăng
+    // vọt (21s+) sau khi đổi sang song song. Sửa: bọc forum trong Promise.race
+    // với 1 timeout NGẮN CỨNG (không retry) — nếu forum không trả lời kịp, bỏ
+    // qua ngay, không chờ đủ retry vì DuckDuckGo đang chạy song song rồi.
     console.log(`🔍 Trying KamiForum + DuckDuckGo (song song)...`);
-    const [forumResult, ddgResult] = await Promise.allSettled([
+
+    const forumWithHardTimeout = Promise.race([
       searchKamiForum(query),
+      new Promise((resolve) => setTimeout(() => resolve(null), 2500))
+    ]);
+
+    const [forumResult, ddgResult] = await Promise.allSettled([
+      forumWithHardTimeout,
       searchDuckDuckGo(query)
     ]);
 
@@ -657,7 +665,7 @@ async function smartSearch(query, searchType) {
       searchCache.set(cacheKey, normalized);
       return normalized;
     }
-    console.log(`❌ KamiForum failed (song song)`);
+    console.log(`❌ KamiForum failed hoặc timeout (song song)`);
 
     if (ddgValue) {
       console.log(`✅ DuckDuckGo success (song song)`);
