@@ -130,41 +130,6 @@ function normalizeForCache(message) {
     .substring(0, 200);
 }
 
-// Stopword tiếng Việt cơ bản — loại từ nối/hư từ trước khi đưa vào to_tsquery,
-// để tránh query kiểu "là | và | của | tổng | thống | mỹ" làm loãng kết quả
-// (những từ này match gần như MỌI bài viết, kéo rank của từ khóa thật xuống).
-const VI_STOPWORDS = new Set([
-  'là', 'gì', 'và', 'của', 'các', 'có', 'được', 'cho', 'về', 'này', 'đó',
-  'khi', 'thì', 'mà', 'như', 'để', 'với', 'từ', 'trong', 'ngoài', 'trên',
-  'dưới', 'sao', 'sao vậy', 'nên', 'hay', 'hoặc', 'nếu', 'vì', 'do', 'bị',
-  'sẽ', 'đã', 'đang', 'rồi', 'nào', 'ai', 'bạn', 'tôi', 'mình', 'ơi',
-  'à', 'ạ', 'nhé', 'nha', 'vậy', 'thế', 'không', 'chưa', 'hãy', 'hãy giúp',
-  'giúp', 'giùm', 'cho tôi', 'cho mình', 'làm', 'một', 'những', 'lại'
-]);
-
-// to_tsquery không tự tách câu như plainto_tsquery — cần tự trích từ khóa
-// và nối bằng toán tử OR (|) để search_forum_content() tìm được bài chỉ
-// chứa MỘT PHẦN từ khóa trong câu hỏi (thay vì AND hết toàn bộ câu, gần
-// như luôn miss với câu hỏi tự nhiên dài).
-function extractSearchKeywords(message, maxKeywords = 6) {
-  const words = message
-    .toLowerCase()
-    .replace(/[.,!?;:'"()]/g, ' ')
-    .split(/\s+/)
-    .map(w => w.trim())
-    .filter(w => w.length >= 2 && !VI_STOPWORDS.has(w));
-
-  // Loại trùng, giữ thứ tự xuất hiện
-  const unique = [...new Set(words)].slice(0, maxKeywords);
-
-  // to_tsquery cấm ký tự đặc biệt ngoài chữ/số — escape để không lỗi cú pháp
-  const safe = unique
-    .map(w => w.replace(/[^\p{L}\p{N}_]/gu, ''))
-    .filter(w => w.length >= 2);
-
-  return safe.join(' | ');
-}
-
 // Chuẩn hóa kết quả search về 1 format thống nhất để tránh AI hiểu sai cấu trúc.
 function normalizeSearchResult(raw) {
   if (!raw) return null;
@@ -331,82 +296,9 @@ async function searchWithRetry(searchFn, name) {
 
 // ============ SEARCH SOURCES ============
 
-const KAMI_FORUM_API = 'https://memory-orpin-two.vercel.app/api/forum';
-
-// 0. Kami Forum — nguồn nội bộ, thử trước web ngoài vì là kiến thức cộng
-//    đồng đã qua kiểm duyệt (status='approved'). Dùng RPC search_forum_content
-//    (full-text search Postgres qua to_tsquery), KHÔNG dùng action=search cũ
-//    (ilike substring) vì ilike chỉ khớp khi từ khóa xuất hiện y hệt trong
-//    bài viết — gần như luôn miss với câu hỏi diễn đạt khác từ vựng.
-const searchKamiForum = (query) => searchWithRetry(async () => {
-  const keywords = extractSearchKeywords(query);
-  if (!keywords) return null; // câu hỏi toàn stopword, không có gì để tìm
-
-  const response = await axios.get(KAMI_FORUM_API, {
-    params: { action: 'searchFts', q: keywords, limit: 3 },
-    timeout: 5000
-  });
-
-  const rows = response.data?.results;
-  if (!rows || rows.length === 0) return null;
-
-  return {
-    source: 'KamiForum',
-    results: rows.map(r => ({
-      title: r.title,
-      content: (r.content || '').substring(0, 500),
-      url: `kamiforum://post/${r.id}`
-    }))
-  };
-}, 'KamiForum');
-
-// 1. DuckDuckGo Instant Answer — free, không key
-//    Mạnh với: câu hỏi 1 đáp án rõ (thủ đô, định nghĩa ngắn, knowledge panel)
-//    Yếu với: câu hỏi cần giải thích sâu, tin tức, chủ đề ít phổ biến
-const searchDuckDuckGo = (query) => searchWithRetry(async () => {
-  const response = await axios.get('https://api.duckduckgo.com/', {
-    params: {
-      q: query,
-      format: 'json',
-      no_html: 1,
-      skip_disambig: 1
-    },
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)'
-    },
-    timeout: 5000
-  });
-
-  const data = response.data;
-
-  if (data.Abstract) {
-    return {
-      source: 'DuckDuckGo',
-      title: data.Heading || query,
-      content: data.Abstract,
-      url: data.AbstractURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
-    };
-  }
-
-  if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-    const firstTopic = data.RelatedTopics[0];
-    if (firstTopic.Text) {
-      return {
-        source: 'DuckDuckGo',
-        title: firstTopic.Text.split(' - ')[0] || query,
-        content: firstTopic.Text,
-        url: firstTopic.FirstURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
-      };
-    }
-  }
-
-  return null;
-}, 'DuckDuckGo');
-
-// 2. Wikipedia tiếng Việt — free, không key
+// 1. Wikipedia tiếng Việt — không key
 //    Mạnh với: khái niệm, lịch sử, nhân vật, khoa học, địa lý, văn hóa
 //    Yếu với: tin tức thời sự, sự kiện mới, giá cả
-//    Bổ trợ DDG: DDG miss → Wikipedia thường có bài đầy đủ hơn
 const searchWikipedia = (query) => searchWithRetry(async () => {
   // Bước 1: Tìm title bài phù hợp nhất
   const searchResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
@@ -630,52 +522,12 @@ async function smartSearch(query, searchType) {
   console.log(`🔍 Search type: ${searchType}`);
   let result = null;
 
-  // Realtime (giá, thời tiết, tin tức) → skip DDG + Wikipedia vì chúng không có dữ liệu thời gian thực
+  // Realtime (giá, thời tiết, tin tức) → skip Wikipedia vì không có dữ liệu thời gian thực
   // Thẳng Serper/Tavily để tiết kiệm thời gian
   const isRealtime = searchType === 'realtime';
 
   if (!isRealtime) {
-    // 0+1. Kami Forum + DuckDuckGo chạy SONG SONG thay vì tuần tự.
-    // QUAN TRỌNG: Promise.allSettled chờ CẢ HAI xong, không phải "ai xong trước".
-    // Nếu forum bị treo (lỗi Supabase, RPC chưa deploy...), searchKamiForum còn có
-    // retryWithBackoff bên trong (2 lần thử, mỗi lần timeout 5s + backoff 1s) ->
-    // riêng forum có thể kéo tới ~11s dù DuckDuckGo đã xong từ giây đầu tiên, và
-    // allSettled vẫn đứng chờ đủ 11s đó. Đây là nguyên nhân response time tăng
-    // vọt (21s+) sau khi đổi sang song song. Sửa: bọc forum trong Promise.race
-    // với 1 timeout NGẮN CỨNG (không retry) — nếu forum không trả lời kịp, bỏ
-    // qua ngay, không chờ đủ retry vì DuckDuckGo đang chạy song song rồi.
-    console.log(`🔍 Trying KamiForum + DuckDuckGo (song song)...`);
-
-    const forumWithHardTimeout = Promise.race([
-      searchKamiForum(query),
-      new Promise((resolve) => setTimeout(() => resolve(null), 2500))
-    ]);
-
-    const [forumResult, ddgResult] = await Promise.allSettled([
-      forumWithHardTimeout,
-      searchDuckDuckGo(query)
-    ]);
-
-    const forumValue = forumResult.status === 'fulfilled' ? forumResult.value : null;
-    const ddgValue = ddgResult.status === 'fulfilled' ? ddgResult.value : null;
-
-    if (forumValue) {
-      console.log(`✅ KamiForum success (song song)`);
-      const normalized = normalizeSearchResult(forumValue);
-      searchCache.set(cacheKey, normalized);
-      return normalized;
-    }
-    console.log(`❌ KamiForum failed hoặc timeout (song song)`);
-
-    if (ddgValue) {
-      console.log(`✅ DuckDuckGo success (song song)`);
-      const normalized = normalizeSearchResult(ddgValue);
-      searchCache.set(cacheKey, normalized);
-      return normalized;
-    }
-    console.log(`❌ DuckDuckGo failed`);
-
-    // 2. Wikipedia tiếng Việt — free, tốt cho khái niệm/giải thích sâu
+    // 1. Wikipedia tiếng Việt — tốt cho khái niệm/giải thích sâu
     console.log(`🔍 Trying Wikipedia...`);
     result = await searchWikipedia(query);
     if (result) {
@@ -687,7 +539,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Wikipedia failed`);
   }
 
-  // 3. Serper — có key, dùng khi free sources thất bại hoặc realtime
+  // 2. Serper — có key, dùng khi free sources thất bại hoặc realtime
   if (SERPER_API_KEY) {
     console.log(`🔍 Trying Serper...`);
     result = await searchSerper(query);
@@ -700,7 +552,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Serper failed`);
   }
 
-  // 4. Tavily — fallback cuối
+  // 3. Tavily — fallback cuối
   if (TAVILY_API_KEY) {
     console.log(`🔍 Trying Tavily...`);
     result = await searchTavily(query);
