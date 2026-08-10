@@ -2,16 +2,6 @@ import Groq from 'groq-sdk';
 import { Redis } from '@upstash/redis';
 import axios from 'axios';
 
-// Vercel Node.js runtime BUFFER TOÀN BỘ response trước khi gửi cho client theo
-// mặc định — dù code gọi res.write() nhiều lần, client chỉ nhận được 1 cục duy
-// nhất khi function chạy xong. Phải khai báo rõ config này để Vercel bật chế độ
-// response streaming thật sự cho function, nếu không toàn bộ phần SSE
-// (res.writeHead + res.write nhiều lần trong handler) sẽ vô tác dụng ở production
-// dù chạy đúng ở local dev.
-export const config = {
-  supportsResponseStreaming: true
-};
-
 let redis = null;
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
 
@@ -116,13 +106,7 @@ const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'
 // Chỉ match cụm từ đầy đủ, không match "giá" đơn.
 // Xóa "đang" khỏi current vì match gần như mọi câu tiến hành ngữ → false positive.
 const DETECTION_PATTERNS = {
-  // Trước: ^(...)$ khớp TUYỆT ĐỐI toàn chuỗi - "Chào!", "chào bạn", "hi Kami"
-  // đều KHÔNG khớp (có ký tự thừa), rơi xuống confidence 0.5 → phải gọi AI
-  // detection tốn thêm ~400-700ms dù rõ ràng không cần search. Nới lỏng: chỉ
-  // cần bắt đầu bằng 1 trong các từ chào/xã giao, cho phép có thêm chữ phía sau
-  // (dấu câu, tên gọi, lời chào kèm...), miễn câu không dài (dưới 20 ký tự -
-  // câu dài hơn thường là câu hỏi thật kèm lời chào, ví dụ "chào Kami, cho tao hỏi...").
-  never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)\b/i,
+  never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)$/i,
   explicit: /(tìm kiếm|search|tra cứu|google|tìm đi|tìm lại|tìm giúp|tra giúp)/i,
   realtime: /\b(giá bitcoin|giá vàng|giá dầu|giá xăng|tỷ giá|thời tiết|nhiệt độ|tin tức mới nhất|tin tức hôm nay)\b/i,
   current: /(hiện nay|hiện tại|bây giờ|hôm nay|năm nay|mới nhất|gần đây|vừa rồi|ai là|là ai)/i,
@@ -312,9 +296,53 @@ async function searchWithRetry(searchFn, name) {
 
 // ============ SEARCH SOURCES ============
 
-// 1. Wikipedia tiếng Việt — không key
+// 1. DuckDuckGo Instant Answer — free, không key
+//    Mạnh với: câu hỏi 1 đáp án rõ (thủ đô, định nghĩa ngắn, knowledge panel)
+//    Yếu với: câu hỏi cần giải thích sâu, tin tức, chủ đề ít phổ biến
+const searchDuckDuckGo = (query) => searchWithRetry(async () => {
+  const response = await axios.get('https://api.duckduckgo.com/', {
+    params: {
+      q: query,
+      format: 'json',
+      no_html: 1,
+      skip_disambig: 1
+    },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)'
+    },
+    timeout: 5000
+  });
+
+  const data = response.data;
+
+  if (data.Abstract) {
+    return {
+      source: 'DuckDuckGo',
+      title: data.Heading || query,
+      content: data.Abstract,
+      url: data.AbstractURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
+    };
+  }
+
+  if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+    const firstTopic = data.RelatedTopics[0];
+    if (firstTopic.Text) {
+      return {
+        source: 'DuckDuckGo',
+        title: firstTopic.Text.split(' - ')[0] || query,
+        content: firstTopic.Text,
+        url: firstTopic.FirstURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
+      };
+    }
+  }
+
+  return null;
+}, 'DuckDuckGo');
+
+// 2. Wikipedia tiếng Việt — free, không key
 //    Mạnh với: khái niệm, lịch sử, nhân vật, khoa học, địa lý, văn hóa
 //    Yếu với: tin tức thời sự, sự kiện mới, giá cả
+//    Bổ trợ DDG: DDG miss → Wikipedia thường có bài đầy đủ hơn
 const searchWikipedia = (query) => searchWithRetry(async () => {
   // Bước 1: Tìm title bài phù hợp nhất
   const searchResp = await axios.get('https://vi.wikipedia.org/w/api.php', {
@@ -440,10 +468,7 @@ const searchTavily = (query) => {
 function quickDetect(message) {
   const lower = message.toLowerCase().trim();
 
-  // Chỉ tin "never" (xã giao thuần) khi câu ngắn - câu dài bắt đầu bằng "chào"
-  // nhưng có nội dung hỏi thật phía sau (ví dụ "chào Kami, giá vàng hôm nay
-  // sao rồi") không nên bị chặn search chỉ vì mở đầu bằng lời chào.
-  if (lower.length <= 20 && DETECTION_PATTERNS.never.test(lower)) {
+  if (DETECTION_PATTERNS.never.test(lower)) {
     return { needsSearch: false, confidence: 1.0, reason: 'casual' };
   }
 
@@ -502,10 +527,6 @@ async function shouldSearch(message, groq) {
       ],
       model: 'openai/gpt-oss-20b',
       temperature: 0,
-      // 50 quá ít cho model reasoning: dù reasoning_effort='low', model vẫn tốn
-      // một phần token cho suy nghĩ nội bộ trước khi xuất JSON. Khi ngân sách
-      // cạn giữa chừng, Groq trả lỗi "json_validate_failed" với failed_generation
-      // rỗng thay vì JSON cụt. 150 đủ dư cho cả suy nghĩ ngắn + JSON output.
       max_tokens: 150,
       response_format: { type: "json_object" },
       reasoning_effort: 'low',
@@ -541,12 +562,23 @@ async function smartSearch(query, searchType) {
   console.log(`🔍 Search type: ${searchType}`);
   let result = null;
 
-  // Realtime (giá, thời tiết, tin tức) → skip Wikipedia vì không có dữ liệu thời gian thực
+  // Realtime (giá, thời tiết, tin tức) → skip DDG + Wikipedia vì chúng không có dữ liệu thời gian thực
   // Thẳng Serper/Tavily để tiết kiệm thời gian
   const isRealtime = searchType === 'realtime';
 
   if (!isRealtime) {
-    // 1. Wikipedia tiếng Việt — tốt cho khái niệm/giải thích sâu
+    // 1. DuckDuckGo — free, nhanh, tốt cho knowledge panel
+    console.log(`🔍 Trying DuckDuckGo...`);
+    result = await searchDuckDuckGo(query);
+    if (result) {
+      console.log(`✅ DuckDuckGo success`);
+      const normalized = normalizeSearchResult(result);
+      searchCache.set(cacheKey, normalized);
+      return normalized;
+    }
+    console.log(`❌ DuckDuckGo failed`);
+
+    // 2. Wikipedia tiếng Việt — free, tốt cho khái niệm/giải thích sâu
     console.log(`🔍 Trying Wikipedia...`);
     result = await searchWikipedia(query);
     if (result) {
@@ -558,7 +590,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Wikipedia failed`);
   }
 
-  // 2. Serper — có key, dùng khi free sources thất bại hoặc realtime
+  // 3. Serper — có key, dùng khi free sources thất bại hoặc realtime
   if (SERPER_API_KEY) {
     console.log(`🔍 Trying Serper...`);
     result = await searchSerper(query);
@@ -571,7 +603,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Serper failed`);
   }
 
-  // 3. Tavily — fallback cuối
+  // 4. Tavily — fallback cuối
   if (TAVILY_API_KEY) {
     console.log(`🔍 Trying Tavily...`);
     result = await searchTavily(query);
@@ -664,25 +696,6 @@ async function saveSummaries(userId, conversationId, summaries) {
 
 async function createNewSummary(groq, messages, summaryNumber) {
   try {
-    // messages luôn là 1 lô 40 tin (MEMORY_CONFIG.SUMMARY_THRESHOLD) nhét thẳng
-    // vào prompt qua JSON.stringify, không qua truncateMessagesToFit như các lệnh
-    // gọi khác. Nếu 40 tin đó đủ dài (câu trả lời AI dài), tổng token dễ vượt xa
-    // trần 8000 TPM của Groq -> lỗi 413 "Request too large". Cắt bớt tin CŨ NHẤT
-    // trong lô trước khi tóm tắt: vẫn giữ được phần gần nhất, quan trọng hơn cho
-    // mạch hội thoại, chỉ mất phần xa nhất của riêng đợt 40 tin này.
-    const SUMMARY_TPM_BUDGET = 6000; // chừa dư cho system prompt + max_tokens output
-    let trimmedMessages = messages;
-    let payload = JSON.stringify(trimmedMessages);
-
-    while (trimmedMessages.length > 1 && estimateTokens(payload) > SUMMARY_TPM_BUDGET) {
-      trimmedMessages = trimmedMessages.slice(1);
-      payload = JSON.stringify(trimmedMessages);
-    }
-
-    if (trimmedMessages.length < messages.length) {
-      console.warn(`⚠ Summary ${summaryNumber}: cắt bớt ${messages.length - trimmedMessages.length}/${messages.length} tin cũ nhất để vừa TPM budget`);
-    }
-
     const chatCompletion = await groq.chat.completions.create({
       messages: [
         {
@@ -691,12 +704,12 @@ async function createNewSummary(groq, messages, summaryNumber) {
         },
         {
           role: 'user',
-          content: `Tóm tắt phần ${summaryNumber}:\n${payload}`
+          content: `Tóm tắt phần ${summaryNumber}:\n${JSON.stringify(messages)}`
         }
       ],
       model: 'openai/gpt-oss-20b',
       temperature: 0.3,
-      max_tokens: 400,
+      max_tokens: 700,
       reasoning_effort: 'low',
       include_reasoning: false
     });
@@ -913,78 +926,6 @@ function shrinkMessages(messages) {
   return systemMsg ? [systemMsg, ...shrunk] : shrunk;
 }
 
-// callGroqStream: viết riêng cho luồng trả lời chính, KHÔNG dùng chung với
-// callGroqWithRetry (giữ callGroqWithRetry non-stream nguyên vẹn cho các lệnh
-// gọi phụ như detection/summary/extract — không cần trải nghiệm gõ chữ, và
-// logic shrink/retry ở đó vẫn cần response đầy đủ để bắt lỗi 413/429 an toàn).
-//
-// Lỗi 413 (quá lớn) và 429 (hết quota) từ Groq LUÔN xảy ra ngay khi gửi request,
-// TRƯỚC KHI model sinh token nào — nên trong thực tế, nếu stream đã bắt đầu chảy
-// chunk đầu tiên thì coi như request hợp lệ, không cần lo phải "retry giữa chừng".
-// Nếu lỗi xảy ra trước chunk đầu tiên, vẫn shrink/xoay key và thử lại bình thường.
-async function callGroqStream(userId, messages, onChunk) {
-  let currentKeyIndex = await getUserKeyIndex(userId);
-  let attempts = 0;
-  const maxAttempts = API_KEYS.length;
-  let shrinkAttempts = 0;
-  const maxShrinkAttempts = 3;
-
-  while (attempts < maxAttempts) {
-    try {
-      const apiKey = API_KEYS[currentKeyIndex];
-      const groq = new Groq({ apiKey });
-
-      const stream = await groq.chat.completions.create({
-        messages,
-        model: 'openai/gpt-oss-120b',
-        temperature: 0.7,
-        max_tokens: 2000,
-        top_p: 0.9,
-        stream: true,
-        reasoning_effort: 'low',
-        include_reasoning: false
-      });
-
-      let fullText = '';
-      let receivedAnyChunk = false;
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || '';
-        if (delta) {
-          receivedAnyChunk = true;
-          fullText += delta;
-          onChunk(delta);
-        }
-      }
-
-      await setUserKeyIndex(userId, currentKeyIndex);
-      return fullText;
-
-    } catch (error) {
-      // Lỗi xảy ra SAU khi đã stream vài chunk cho client -> không thể retry êm
-      // (client đã hiển thị 1 phần rồi), đành ném lỗi để handler xử lý dừng stream.
-      // Trường hợp này cực hiếm vì 413/429 luôn xảy ra trước chunk đầu tiên.
-      if (isTooLargeError(error) && shrinkAttempts < maxShrinkAttempts && messages.length > 1) {
-        shrinkAttempts++;
-        messages = shrinkMessages(messages);
-        console.log(`⚠ 413 Request too large (stream), cắt bớt messages (lần ${shrinkAttempts}), thử lại cùng key...`);
-        continue;
-      }
-
-      if (isQuotaOrRateError(error) && attempts < maxAttempts - 1) {
-        console.log(`Key ${currentKeyIndex + 1} hết quota (stream), chuyển key...`);
-        currentKeyIndex = getNextKeyIndex(currentKeyIndex);
-        attempts++;
-        continue;
-      }
-
-      throw error;
-    }
-  }
-
-  throw new Error('Đã thử hết tất cả API keys');
-}
-
 async function callGroqWithRetry(userId, messages) {
   let currentKeyIndex = await getUserKeyIndex(userId);
   let attempts = 0;
@@ -1001,10 +942,7 @@ async function callGroqWithRetry(userId, messages) {
         messages,
         model: 'openai/gpt-oss-120b',
         temperature: 0.7,
-        max_tokens: 2000, // tăng từ 1200 -> 2000 để câu trả lời dài không bị cắt giữa chừng.
-                           // Phải đồng bộ với reserveTokens ở lời gọi truncateMessagesToFit
-                           // (dòng ~1529) — nếu chỉ sửa số ở đây mà không sửa reserveTokens,
-                           // input sẽ ăn lấn vào ngân sách dành cho output.
+        max_tokens: 2000, // đồng bộ với reserveTokens ở truncateMessagesToFit
         top_p: 0.9,
         stream: false,
         reasoning_effort: 'low',   // giảm token dùng cho suy nghĩ nội bộ -> đỡ tốn TPM, nhanh hơn
@@ -1396,26 +1334,6 @@ export default async function handler(req, res) {
       searchDecision = quickDetect(message);
       console.log(`⚡ Quick detection: ${searchDecision.needsSearch ? 'SEARCH' : 'SKIP'} (confidence: ${searchDecision.confidence})`);
 
-      // confidence thấp → quickDetect (regex) không đủ tin cậy, hỏi AI ngay trong
-      // request này để quyết định đúng cho CHÍNH câu hỏi hiện tại, thay vì đoán
-      // "SKIP" và bỏ lỡ search cần thiết. Trước đây việc này chạy nền (không await)
-      // để dành cho request sau, nhưng: (1) key cache theo nội dung câu hỏi đã
-      // chuẩn hóa sơ sài nên hầu như không hit giữa các câu hỏi diễn đạt khác nhau,
-      // (2) trên serverless, promise không await có thể bị runtime cắt ngang trước
-      // khi kịp ghi cache — tốn lượt gọi Groq mà không thu được gì. Gọi đồng bộ ở
-      // đây tốn thêm một lần gọi model nhỏ (20b, max_tokens 50) nhưng đảm bảo có
-      // tác dụng thật cho lượt hỏi đang xử lý.
-      if (searchDecision.confidence < 0.8) {
-        try {
-          searchDecision = await callTempGroqWithRetry(userId, async (groq) => {
-            return shouldSearch(message, groq);
-          });
-          console.log(`🤖 AI detection: ${searchDecision.needsSearch ? 'SEARCH' : 'SKIP'}`);
-        } catch (err) {
-          console.error('AI detection failed, fallback to quickDetect result:', err.message);
-        }
-      }
-
       if (searchDecision.confidence >= 0.8) {
         detectionCache.set(searchCacheKey, searchDecision);
       }
@@ -1426,6 +1344,24 @@ export default async function handler(req, res) {
       if (searchResult) {
         console.log(`✅ Search successful: ${searchResult.source}`);
       }
+    }
+
+    if (!cachedDecision && searchDecision.confidence < 0.8) {
+      // Background: AI detection + prefetch search cho lần sau
+      // (kết quả sẽ được cache, không dùng cho response này)
+      callTempGroqWithRetry(userId, async (groq) => {
+        const aiDecision = await shouldSearch(message, groq);
+        detectionCache.set(searchCacheKey, aiDecision);
+
+        if (aiDecision.needsSearch && !searchResult) {
+          const bgResult = await smartSearch(message, aiDecision.type);
+          if (bgResult) {
+            console.log(`✅ Background search cached for next request: ${bgResult.source}`);
+          }
+        }
+
+        return aiDecision;
+      }).catch(err => console.error('Background detection error:', err));
     }
 
     conversationHistory.push({
@@ -1510,105 +1446,11 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
     let messages = [systemPrompt, ...workingMemory];
     // TPM thật của tài khoản free là 8000, nhưng estimateTokens chỉ là ước lượng
     // (không phải tokenizer thật) nên luôn chừa buffer an toàn ~700 token.
-    // reserveTokens tăng 1200 -> 2000, khớp với max_tokens ở callGroqWithRetry,
-    // để câu trả lời dài không bị cắt giữa chừng. Input (system+history+search)
-    // còn lại (8000-700)-2000 = 5300 token, vẫn đủ rộng rãi cho hầu hết trường hợp.
+    // reserveTokens tăng 1200 -> 2000 để khớp max_tokens mới của callGroqWithRetry,
+    // tránh bị cắt mất đoạn cuối câu trả lời. Đổi lại input (history) sẽ bị cắt bớt nhiều hơn.
     const TPM_SAFETY_BUFFER = 700;
     messages = truncateMessagesToFit(messages, 8000 - TPM_SAFETY_BUFFER, 2000);
     console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
-
-    // Client cũ (chưa cập nhật để đọc SSE) không gửi req.body.stream -> giữ nguyên
-    // hành vi JSON 1 cục như trước, không phá vỡ app đang chạy ngoài production.
-    const wantsStream = req.body.stream === true;
-
-    if (wantsStream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no', // tắt buffer ở proxy (nếu có) để chunk chảy ngay, không gom lại
-        'Content-Encoding': 'identity' // ép không nén - gzip cả response bắt client
-                                        // phải nhận đủ toàn bộ mới giải nén được,
-                                        // vô hiệu hóa việc chunk chảy theo thời gian thực
-      });
-
-      let assistantMessage = '';
-      try {
-        assistantMessage = await callGroqStream(userId, messages, (delta) => {
-          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
-        });
-      } catch (streamError) {
-        console.error('❌ Stream error:', streamError);
-        res.write(`data: ${JSON.stringify({ error: streamError.message || 'Lỗi khi tạo phản hồi' })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        return res.end();
-      }
-
-      console.log(`✅ AI responded (stream)`);
-
-      conversationHistory.push({ role: 'assistant', content: assistantMessage });
-      await saveShortTermMemory(userId, finalConversationId, conversationHistory);
-      responseCache.set(responseCacheKey, assistantMessage);
-
-      if (await shouldExtractNow(userId, finalConversationId, conversationHistory)) {
-        console.log(`🔍 Background extracting...`);
-        callTempGroqWithRetry(userId, async (groq) => {
-          const newInfo = await extractPersonalInfo(groq, conversationHistory);
-          if (Object.keys(newInfo).length > 0) {
-            const updatedProfile = mergeProfile(userProfile, newInfo);
-            await saveLongTermMemory(userId, updatedProfile);
-            await markExtracted(userId, finalConversationId, conversationHistory);
-            console.log(`✅ Profile updated`);
-          } else {
-            await markExtracted(userId, finalConversationId, conversationHistory);
-          }
-          return newInfo;
-        }).catch(err => console.error('Background extract error:', err));
-      }
-
-      if (redis) {
-        const chatKey = `chat:${userId}:${finalConversationId}`;
-        const ttl = await redis.ttl(chatKey);
-        const daysRemaining = ttl / 86400;
-        if (daysRemaining > 0 && daysRemaining < 2 && conversationHistory.length >= 3) {
-          console.log(`⚠ Safety extract...`);
-          callTempGroqWithRetry(userId, async (groq) => {
-            const newInfo = await extractPersonalInfo(groq, conversationHistory);
-            if (Object.keys(newInfo).length > 0) {
-              const updatedProfile = mergeProfile(userProfile, newInfo);
-              await saveLongTermMemory(userId, updatedProfile);
-              console.log(`✅ Safety profile saved`);
-            }
-            return newInfo;
-          }).catch(err => console.error('Background safety extract error:', err));
-        }
-      }
-
-      const responseTime = Date.now() - startTime;
-      console.log(`⚡ Response time: ${responseTime}ms`);
-
-      // Sự kiện cuối cùng: gửi kèm metadata (giống phần "stats" của bản JSON cũ)
-      // để client có thể cập nhật UI phụ (thời gian phản hồi, nguồn search...)
-      // sau khi text đã hiện xong hết.
-      res.write(`data: ${JSON.stringify({
-        done: true,
-        responseTime,
-        stats: {
-          totalMessages: conversationHistory.length,
-          workingMemorySize: workingMemory.length,
-          summariesCount: summaries.length,
-          summariesInContext: context.contextInfo.summariesInContext,
-          userProfileFields: Object.keys(userProfile).length,
-          storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
-          searchUsed: !!searchResult,
-          searchSource: searchResult?.source || null,
-          modelUsed: 'openai/gpt-oss-120b',
-          cached: false
-        }
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      return res.end();
-    }
 
     const chatCompletion = await callGroqWithRetry(userId, messages);
 
@@ -1715,19 +1557,6 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
   } catch (error) {
     console.error('❌ Error:', error);
     console.error('Error stack:', error.stack);
-
-    // Nếu đã writeHead cho SSE (stream), không thể res.status().json() nữa -
-    // header đã gửi, gọi lại sẽ crash với ERR_HTTP_HEADERS_SENT. Đóng stream
-    // bằng 1 sự kiện lỗi thay vì đổi response type giữa chừng.
-    if (res.headersSent) {
-      try {
-        res.write(`data: ${JSON.stringify({ error: error.message || 'Internal server error' })}\n\n`);
-        res.write('data: [DONE]\n\n');
-      } catch (writeErr) {
-        console.error('Failed to write error to stream:', writeErr);
-      }
-      return res.end();
-    }
 
     return res.status(500).json({
       success: false,
