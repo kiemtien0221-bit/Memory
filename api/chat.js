@@ -2,6 +2,16 @@ import Groq from 'groq-sdk';
 import { Redis } from '@upstash/redis';
 import axios from 'axios';
 
+// Vercel Node.js runtime BUFFER TOÀN BỘ response trước khi gửi cho client theo
+// mặc định — dù code gọi res.write() nhiều lần, client chỉ nhận được 1 cục duy
+// nhất khi function chạy xong. Phải khai báo rõ config này để Vercel bật chế độ
+// response streaming thật sự cho function, nếu không toàn bộ phần SSE
+// (res.writeHead + res.write nhiều lần trong handler) sẽ vô tác dụng ở production
+// dù chạy đúng ở local dev.
+export const config = {
+  supportsResponseStreaming: true
+};
+
 let redis = null;
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
 
