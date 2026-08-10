@@ -116,7 +116,13 @@ const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'
 // Chỉ match cụm từ đầy đủ, không match "giá" đơn.
 // Xóa "đang" khỏi current vì match gần như mọi câu tiến hành ngữ → false positive.
 const DETECTION_PATTERNS = {
-  never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)$/i,
+  // Trước: ^(...)$ khớp TUYỆT ĐỐI toàn chuỗi - "Chào!", "chào bạn", "hi Kami"
+  // đều KHÔNG khớp (có ký tự thừa), rơi xuống confidence 0.5 → phải gọi AI
+  // detection tốn thêm ~400-700ms dù rõ ràng không cần search. Nới lỏng: chỉ
+  // cần bắt đầu bằng 1 trong các từ chào/xã giao, cho phép có thêm chữ phía sau
+  // (dấu câu, tên gọi, lời chào kèm...), miễn câu không dài (dưới 20 ký tự -
+  // câu dài hơn thường là câu hỏi thật kèm lời chào, ví dụ "chào Kami, cho tao hỏi...").
+  never: /^(chào|hello|hi|xin chào|hey|cảm ơn|thank|thanks|tạm biệt|bye|goodbye|ok|okay|được|rồi|ừ|uhm)\b/i,
   explicit: /(tìm kiếm|search|tra cứu|google|tìm đi|tìm lại|tìm giúp|tra giúp)/i,
   realtime: /\b(giá bitcoin|giá vàng|giá dầu|giá xăng|tỷ giá|thời tiết|nhiệt độ|tin tức mới nhất|tin tức hôm nay)\b/i,
   current: /(hiện nay|hiện tại|bây giờ|hôm nay|năm nay|mới nhất|gần đây|vừa rồi|ai là|là ai)/i,
@@ -434,7 +440,10 @@ const searchTavily = (query) => {
 function quickDetect(message) {
   const lower = message.toLowerCase().trim();
 
-  if (DETECTION_PATTERNS.never.test(lower)) {
+  // Chỉ tin "never" (xã giao thuần) khi câu ngắn - câu dài bắt đầu bằng "chào"
+  // nhưng có nội dung hỏi thật phía sau (ví dụ "chào Kami, giá vàng hôm nay
+  // sao rồi") không nên bị chặn search chỉ vì mở đầu bằng lời chào.
+  if (lower.length <= 20 && DETECTION_PATTERNS.never.test(lower)) {
     return { needsSearch: false, confidence: 1.0, reason: 'casual' };
   }
 
@@ -1517,7 +1526,10 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no' // tắt buffer ở proxy (nếu có) để chunk chảy ngay, không gom lại
+        'X-Accel-Buffering': 'no', // tắt buffer ở proxy (nếu có) để chunk chảy ngay, không gom lại
+        'Content-Encoding': 'identity' // ép không nén - gzip cả response bắt client
+                                        // phải nhận đủ toàn bộ mới giải nén được,
+                                        // vô hiệu hóa việc chunk chảy theo thời gian thực
       });
 
       let assistantMessage = '';
