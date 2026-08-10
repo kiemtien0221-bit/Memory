@@ -1,7 +1,7 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/**/*.js", "use": "@vercel/node" }
+    { "src": "api/**/*.js", "use": "@vercel/node", "config": { "supportsResponseStreaming": true } }
   ],
   "routes": [
     { "src": "/api/auth/change-password", "dest": "/api/auth.js?action=change-password" },
