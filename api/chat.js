@@ -630,8 +630,23 @@ async function saveSummaries(userId, conversationId, summaries) {
   await setData(key, JSON.stringify(summaries), MEMORY_CONFIG.SHORT_TERM_DAYS * 86400);
 }
 
+// Cắt bớt nội dung mỗi tin nhắn trước khi đưa vào prompt tóm tắt, để tổng 40 tin nhắn
+// không bao giờ vượt TPM limit (8000) của Groq. Từng xảy ra lỗi 413 "Requested 19949"
+// vì JSON.stringify nguyên văn 40 tin nhắn dài (đoạn văn, code...) không giới hạn gì.
+const SUMMARY_PER_MESSAGE_CHAR_LIMIT = 500;
+
+function truncateMessagesForSummary(messages) {
+  return messages.map(m => ({
+    role: m.role,
+    content: typeof m.content === 'string' && m.content.length > SUMMARY_PER_MESSAGE_CHAR_LIMIT
+      ? m.content.slice(0, SUMMARY_PER_MESSAGE_CHAR_LIMIT) + '...'
+      : m.content
+  }));
+}
+
 async function createNewSummary(groq, messages, summaryNumber) {
   try {
+    const safeMessages = truncateMessagesForSummary(messages);
     const chatCompletion = await groq.chat.completions.create({
       messages: [
         {
@@ -640,7 +655,7 @@ async function createNewSummary(groq, messages, summaryNumber) {
         },
         {
           role: 'user',
-          content: `Tóm tắt phần ${summaryNumber}:\n${JSON.stringify(messages)}`
+          content: `Tóm tắt phần ${summaryNumber}:\n${JSON.stringify(safeMessages)}`
         }
       ],
       model: 'openai/gpt-oss-20b',
@@ -650,10 +665,13 @@ async function createNewSummary(groq, messages, summaryNumber) {
       include_reasoning: false
     });
 
-    return chatCompletion.choices[0]?.message?.content || '';
+    return chatCompletion.choices[0]?.message?.content || null;
   } catch (error) {
     console.error('Error creating summary:', error);
-    return `[Summary ${summaryNumber}] Cuộc trò chuyện tiếp diễn...`;
+    // Trả null thay vì placeholder rác — để manageMemory KHÔNG lưu summary lỗi
+    // vào Redis, tránh mất vĩnh viễn nội dung đoạn hội thoại đó. Lần request
+    // sau sẽ tự thử tóm tắt lại đúng đoạn này (messagesProcessed không tăng).
+    return null;
   }
 }
 
@@ -679,6 +697,14 @@ async function manageMemory(userId, conversationId, conversationHistory, groq) {
     console.log(`📝 Creating summary ${summaryNumber} from messages ${startIdx}-${endIdx}...`);
 
     const newSummary = await createNewSummary(groq, messagesToSummarize, summaryNumber);
+
+    if (newSummary === null) {
+      // Tạo summary thất bại (vd. 413 quá token) — không lưu gì cả, giữ nguyên
+      // summaries cũ. messagesProcessed không tăng nên lần request sau sẽ tự
+      // thử lại đúng đoạn 200-240 này thay vì bỏ sót nội dung vĩnh viễn.
+      console.error(`❌ Summary ${summaryNumber} failed, will retry next request`);
+      return summaries;
+    }
 
     summaries.push({
       number: summaryNumber,
