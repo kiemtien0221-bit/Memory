@@ -296,50 +296,7 @@ async function searchWithRetry(searchFn, name) {
 
 // ============ SEARCH SOURCES ============
 
-// 1. DuckDuckGo Instant Answer — free, không key
-//    Mạnh với: câu hỏi 1 đáp án rõ (thủ đô, định nghĩa ngắn, knowledge panel)
-//    Yếu với: câu hỏi cần giải thích sâu, tin tức, chủ đề ít phổ biến
-const searchDuckDuckGo = (query) => searchWithRetry(async () => {
-  const response = await axios.get('https://api.duckduckgo.com/', {
-    params: {
-      q: query,
-      format: 'json',
-      no_html: 1,
-      skip_disambig: 1
-    },
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Kami/1.0)'
-    },
-    timeout: 5000
-  });
-
-  const data = response.data;
-
-  if (data.Abstract) {
-    return {
-      source: 'DuckDuckGo',
-      title: data.Heading || query,
-      content: data.Abstract,
-      url: data.AbstractURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
-    };
-  }
-
-  if (data.RelatedTopics && data.RelatedTopics.length > 0) {
-    const firstTopic = data.RelatedTopics[0];
-    if (firstTopic.Text) {
-      return {
-        source: 'DuckDuckGo',
-        title: firstTopic.Text.split(' - ')[0] || query,
-        content: firstTopic.Text,
-        url: firstTopic.FirstURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
-      };
-    }
-  }
-
-  return null;
-}, 'DuckDuckGo');
-
-// 2. Wikipedia tiếng Việt — free, không key
+// 1. Wikipedia tiếng Việt — free, không key
 //    Mạnh với: khái niệm, lịch sử, nhân vật, khoa học, địa lý, văn hóa
 //    Yếu với: tin tức thời sự, sự kiện mới, giá cả
 //    Bổ trợ DDG: DDG miss → Wikipedia thường có bài đầy đủ hơn
@@ -499,18 +456,10 @@ function quickDetect(message) {
 }
 
 // shouldSearch chỉ lo phần AI detection — không gọi lại quickDetect
-// (handler đã gọi quickDetect trước rồi mới vào đây nếu confidence < 0.8)
+// (handler đã gọi quickDetect trước, và chỉ gọi hàm này khi confidence < 0.8
+// VÀ chưa có cache — nên không cần tự check detectionCache ở đây nữa)
 async function shouldSearch(message, groq) {
   if (IS_DEV) stats.search.total++;
-
-  const cacheKey = normalizeForCache(message);
-  const cached = detectionCache.get(cacheKey);
-
-  if (cached) {
-    if (IS_DEV) stats.search.cacheHits++;
-    console.log(`💾 Detection cache hit`);
-    return cached;
-  }
 
   console.log(`🤖 Using AI detection`);
   try {
@@ -540,13 +489,10 @@ async function shouldSearch(message, groq) {
       type: result.type || 'knowledge'
     };
 
-    detectionCache.set(cacheKey, aiDecision);
     return aiDecision;
   } catch (error) {
     console.error('AI detection error:', error);
-    const fallback = { needsSearch: false, confidence: 0.5 };
-    detectionCache.set(cacheKey, fallback);
-    return fallback;
+    return { needsSearch: false, confidence: 0.5 };
   }
 }
 
@@ -567,18 +513,8 @@ async function smartSearch(query, searchType) {
   const isRealtime = searchType === 'realtime';
 
   if (!isRealtime) {
-    // 1. DuckDuckGo — free, nhanh, tốt cho knowledge panel
-    console.log(`🔍 Trying DuckDuckGo...`);
-    result = await searchDuckDuckGo(query);
-    if (result) {
-      console.log(`✅ DuckDuckGo success`);
-      const normalized = normalizeSearchResult(result);
-      searchCache.set(cacheKey, normalized);
-      return normalized;
-    }
-    console.log(`❌ DuckDuckGo failed`);
-
-    // 2. Wikipedia tiếng Việt — free, tốt cho khái niệm/giải thích sâu
+    // 1. Wikipedia tiếng Việt — free, tốt cho khái niệm/giải thích sâu
+    // (đã bỏ DuckDuckGo: liên tục fail trong thực tế, chỉ tốn ~90ms mỗi request vô ích)
     console.log(`🔍 Trying Wikipedia...`);
     result = await searchWikipedia(query);
     if (result) {
@@ -590,7 +526,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Wikipedia failed`);
   }
 
-  // 3. Serper — có key, dùng khi free sources thất bại hoặc realtime
+  // 2. Serper — có key, dùng khi free sources thất bại hoặc realtime
   if (SERPER_API_KEY) {
     console.log(`🔍 Trying Serper...`);
     result = await searchSerper(query);
@@ -603,7 +539,7 @@ async function smartSearch(query, searchType) {
     console.log(`❌ Serper failed`);
   }
 
-  // 4. Tavily — fallback cuối
+  // 3. Tavily — fallback cuối
   if (TAVILY_API_KEY) {
     console.log(`🔍 Trying Tavily...`);
     result = await searchTavily(query);
@@ -1322,7 +1258,6 @@ export default async function handler(req, res) {
 
     console.log(`💾 Loaded ${conversationHistory.length} messages`);
 
-    let searchResult = null;
     const searchCacheKey = normalizeForCache(message);
     const cachedDecision = detectionCache.get(searchCacheKey);
     let searchDecision = null;
@@ -1339,47 +1274,42 @@ export default async function handler(req, res) {
       }
     }
 
-    if (searchDecision.needsSearch) {
-      searchResult = await smartSearch(message, searchDecision.type);
-      if (searchResult) {
-        console.log(`✅ Search successful: ${searchResult.source}`);
-      }
-    }
-
-    if (!cachedDecision && searchDecision.confidence < 0.8) {
-      // Background: AI detection + prefetch search cho lần sau
-      // (kết quả sẽ được cache, không dùng cho response này)
-      callTempGroqWithRetry(userId, async (groq) => {
-        const aiDecision = await shouldSearch(message, groq);
-        detectionCache.set(searchCacheKey, aiDecision);
-
-        if (aiDecision.needsSearch && !searchResult) {
-          const bgResult = await smartSearch(message, aiDecision.type);
-          if (bgResult) {
-            console.log(`✅ Background search cached for next request: ${bgResult.source}`);
-          }
-        }
-
-        return aiDecision;
-      }).catch(err => console.error('Background detection error:', err));
-    }
-
     conversationHistory.push({
       role: 'user',
       content: message.trim()
     });
 
+    // Chạy song song: search (nếu cần) + manageMemory — 2 việc này độc lập nhau,
+    // đều cần xong trước khi build prompt gọi AI chính nên gộp lại tiết kiệm thời gian
+    // thay vì chờ tuần tự (trước đây search xong mới bắt đầu manageMemory).
+    const searchPromise = searchDecision.needsSearch
+      ? smartSearch(message, searchDecision.type).then(result => {
+          if (result) console.log(`✅ Search successful: ${result.source}`);
+          return result;
+        })
+      : Promise.resolve(null);
+
     // Wrap manageMemory trong callTempGroqWithRetry để có key rotation khi rate limit.
     // Nếu tất cả keys đều lỗi, fallback dùng summaries cũ để không làm 500 cả request.
-    let summaries = [];
-    try {
-      summaries = await callTempGroqWithRetry(userId, async (groq) => {
-        return manageMemory(userId, finalConversationId, conversationHistory, groq);
-      });
-    } catch (err) {
+    const memoryPromise = callTempGroqWithRetry(userId, async (groq) => {
+      return manageMemory(userId, finalConversationId, conversationHistory, groq);
+    }).catch(err => {
       console.error('manageMemory failed, using existing summaries:', err.message);
-      summaries = await getSummaries(userId, finalConversationId);
+      return getSummaries(userId, finalConversationId);
+    });
+
+    if (!cachedDecision && searchDecision.confidence < 0.8) {
+      // Background: chỉ chạy AI detection để cache quyết định needsSearch/type cho câu hỏi
+      // giống hệt lần sau. Đã bỏ phần prefetch search: câu hỏi thực tế ít khi lặp lại
+      // nguyên văn nên hit rate thấp, không đáng tốn thêm 1 lần gọi Groq + network mỗi request.
+      callTempGroqWithRetry(userId, async (groq) => {
+        const aiDecision = await shouldSearch(message, groq);
+        detectionCache.set(searchCacheKey, aiDecision);
+        return aiDecision;
+      }).catch(err => console.error('Background detection error:', err));
     }
+
+    const [searchResult, summaries] = await Promise.all([searchPromise, memoryPromise]);
 
     const context = buildContext(conversationHistory, summaries);
     const workingMemory = context.recentMessages;
