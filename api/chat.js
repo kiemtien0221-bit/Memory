@@ -936,110 +936,6 @@ async function callGroqWithRetry(userId, messages) {
   throw new Error('Đã thử hết tất cả API keys');
 }
 
-function setupSSE(res) {
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  // Mở stream ngay để client không phải chờ delta đầu tiên.
-  res.write(': connected\n\n');
-
-  // Một số runtime Node hỗ trợ flushHeaders; nếu có thì đẩy header ngay.
-  if (typeof res.flushHeaders === 'function') {
-    res.flushHeaders();
-  }
-}
-
-function sendSSE(res, data) {
-  if (!res || res.writableEnded) return;
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
-}
-
-function endSSE(res) {
-  if (!res || res.writableEnded) return;
-  res.write('data: [DONE]\n\n');
-  res.end();
-}
-
-async function callGroqStreamWithRetry(userId, messages, onDelta) {
-  let currentKeyIndex = await getUserKeyIndex(userId);
-  let attempts = 0;
-  const maxAttempts = API_KEYS.length;
-  let shrinkAttempts = 0;
-  const maxShrinkAttempts = 3;
-
-  while (attempts < maxAttempts) {
-    let emittedText = '';
-
-    try {
-      const apiKey = API_KEYS[currentKeyIndex];
-      const groq = new Groq({ apiKey });
-
-      const stream = await groq.chat.completions.create({
-        messages,
-        model: 'openai/gpt-oss-120b',
-        temperature: 0.7,
-        max_tokens: 2000,
-        top_p: 0.9,
-        stream: true,
-        reasoning_effort: 'low',
-        include_reasoning: false
-      });
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices?.[0]?.delta?.content || '';
-        if (!delta) continue;
-
-        emittedText += delta;
-
-        if (typeof onDelta === 'function') {
-          onDelta(delta);
-        }
-      }
-
-      await setUserKeyIndex(userId, currentKeyIndex);
-
-      return emittedText;
-
-    } catch (error) {
-      // Nếu đã gửi một phần câu trả lời xuống client thì KHÔNG retry,
-      // vì retry stream sẽ làm nội dung bị lặp từ đầu.
-      if (emittedText) {
-        throw error;
-      }
-
-      if (
-        isTooLargeError(error) &&
-        shrinkAttempts < maxShrinkAttempts &&
-        messages.length > 1
-      ) {
-        shrinkAttempts++;
-        messages = shrinkMessages(messages);
-        console.log(
-          `⚠ 413 Request too large, cắt bớt messages (lần ${shrinkAttempts}), thử lại cùng key...`
-        );
-        continue;
-      }
-
-      if (
-        isQuotaOrRateError(error) &&
-        attempts < maxAttempts - 1
-      ) {
-        console.log(`Key ${currentKeyIndex + 1} hết quota, chuyển key...`);
-        currentKeyIndex = getNextKeyIndex(currentKeyIndex);
-        attempts++;
-        continue;
-      }
-
-      throw error;
-    }
-  }
-
-  throw new Error('Đã thử hết tất cả API keys');
-}
-
 async function callTempGroqWithRetry(userId, fn) {
   let currentKeyIndex = await getUserKeyIndex(userId);
   let attempts = 0;
@@ -1251,8 +1147,6 @@ export default async function handler(req, res) {
     }
 
     const finalConversationId = conversationId || 'default';
-    const wantsStream = req.body.stream === true || req.body.stream === 'true';
-    let streamStarted = false;
 
     if (message === '/history') {
       const conversationHistory = await getShortTermMemory(userId, finalConversationId);
@@ -1370,21 +1264,6 @@ export default async function handler(req, res) {
       }
 
       const responseTime = Date.now() - startTime;
-
-      if (wantsStream) {
-        setupSSE(res);
-        streamStarted = true;
-
-        sendSSE(res, { delta: cachedResponse });
-        sendSSE(res, {
-          done: true,
-          responseTime: responseTime,
-          cached: true
-        });
-        endSSE(res);
-        return;
-      }
-
       return res.status(200).json({
         success: true,
         message: cachedResponse,
@@ -1529,27 +1408,9 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
     messages = truncateMessagesToFit(messages, 8000 - TPM_SAFETY_BUFFER, 2000);
     console.log(`🤖 Calling AI with ${messages.length - 1} history messages (est ~${estimateTokens(messages.map(m => m.content).join(''))} tokens)...`);
 
-    let assistantMessage = '';
+    const chatCompletion = await callGroqWithRetry(userId, messages);
 
-    if (wantsStream) {
-      setupSSE(res);
-      streamStarted = true;
-
-      assistantMessage = await callGroqStreamWithRetry(
-        userId,
-        messages,
-        (delta) => {
-          sendSSE(res, { delta: delta });
-        }
-      );
-
-      if (!assistantMessage || assistantMessage.trim() === '') {
-        assistantMessage = 'Không có phản hồi';
-      }
-    } else {
-      const chatCompletion = await callGroqWithRetry(userId, messages);
-      assistantMessage = chatCompletion.choices[0]?.message?.content || 'Không có phản hồi';
-    }
+    const assistantMessage = chatCompletion.choices[0]?.message?.content || 'Không có phản hồi';
 
     console.log(`✅ AI responded`);
 
@@ -1558,52 +1419,60 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
       content: assistantMessage
     });
 
+    // Bắt buộc await: đây là lưu lịch sử chat thật, mất thì tin nhắn vừa gửi
+    // biến mất khỏi conversationHistory ở lần load kế tiếp.
     await saveShortTermMemory(userId, finalConversationId, conversationHistory);
 
     responseCache.set(responseCacheKey, assistantMessage);
 
-    if (await shouldExtractNow(userId, finalConversationId, conversationHistory)) {
-      console.log(`🔍 Background extracting...`);
-
-      callTempGroqWithRetry(userId, async (groq) => {
-        const newInfo = await extractPersonalInfo(groq, conversationHistory);
-
-        if (Object.keys(newInfo).length > 0) {
-          const updatedProfile = mergeProfile(userProfile, newInfo);
-          await saveLongTermMemory(userId, updatedProfile);
-          await markExtracted(userId, finalConversationId, conversationHistory);
-          console.log(`✅ Profile updated`);
-        } else {
-          await markExtracted(userId, finalConversationId, conversationHistory);
-        }
-
-        return newInfo;
-      })
-        .catch(err => console.error('Background extract error:', err));
-    }
-
-    if (redis) {
-      const chatKey = `chat:${userId}:${finalConversationId}`;
-      const ttl = await redis.ttl(chatKey);
-      const daysRemaining = ttl / 86400;
-
-      if (daysRemaining > 0 && daysRemaining < 2 && conversationHistory.length >= 3) {
-        console.log(`⚠ Safety extract...`);
-
-        callTempGroqWithRetry(userId, async (groq) => {
-          const newInfo = await extractPersonalInfo(groq, conversationHistory);
+    // Từ đây trở xuống: chỉ là "dọn dẹp/ghi nhận" cho lần chat sau, không ảnh hưởng
+    // gì tới response đang trả cho client — đẩy hết ra nền (không await) để giảm
+    // độ trễ. Trước đây các bước check/query Redis này chạy tuần tự TRƯỚC khi trả
+    // response, cộng dồn hơn 1s không cần thiết.
+    (async () => {
+      try {
+        if (await shouldExtractNow(userId, finalConversationId, conversationHistory)) {
+          console.log(`🔍 Background extracting...`);
+          const newInfo = await callTempGroqWithRetry(userId, async (groq) => {
+            return extractPersonalInfo(groq, conversationHistory);
+          });
 
           if (Object.keys(newInfo).length > 0) {
             const updatedProfile = mergeProfile(userProfile, newInfo);
             await saveLongTermMemory(userId, updatedProfile);
-            console.log(`✅ Safety profile saved`);
+            await markExtracted(userId, finalConversationId, conversationHistory);
+            console.log(`✅ Profile updated`);
+          } else {
+            await markExtracted(userId, finalConversationId, conversationHistory);
           }
-
-          return newInfo;
-        })
-          .catch(err => console.error('Background safety extract error:', err));
+        }
+      } catch (err) {
+        console.error('Background extract error:', err);
       }
-    }
+
+      try {
+        if (redis) {
+          const chatKey = `chat:${userId}:${finalConversationId}`;
+          const ttl = await redis.ttl(chatKey);
+          const daysRemaining = ttl / 86400;
+
+          if (daysRemaining > 0 && daysRemaining < 2 && conversationHistory.length >= 3) {
+            console.log(`⚠ Safety extract...`);
+            const newInfo = await callTempGroqWithRetry(userId, async (groq) => {
+              return extractPersonalInfo(groq, conversationHistory);
+            });
+
+            if (Object.keys(newInfo).length > 0) {
+              const updatedProfile = mergeProfile(userProfile, newInfo);
+              await saveLongTermMemory(userId, updatedProfile);
+              console.log(`✅ Safety profile saved`);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Background safety extract error:', err);
+      }
+    })();
 
     const responseTime = Date.now() - startTime;
 
@@ -1629,27 +1498,6 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
 
     console.log(`⚡ Response time: ${responseTime}ms`);
 
-    if (wantsStream) {
-      sendSSE(res, {
-        done: true,
-        responseTime: responseTime,
-        stats: {
-          totalMessages: conversationHistory.length,
-          workingMemorySize: workingMemory.length,
-          summariesCount: summaries.length,
-          summariesInContext: context.contextInfo.summariesInContext,
-          userProfileFields: Object.keys(userProfile).length,
-          storageType: REDIS_ENABLED ? 'Redis' : 'In-Memory',
-          searchUsed: !!searchResult,
-          searchSource: searchResult?.source || null,
-          modelUsed: 'openai/gpt-oss-120b',
-          cached: false
-        }
-      });
-      endSSE(res);
-      return;
-    }
-
     return res.status(200).json({
       success: true,
       message: assistantMessage,
@@ -1673,14 +1521,6 @@ Cách trả lời: Giải thích bản chất trước, chi tiết sau. Mạch l
   } catch (error) {
     console.error('❌ Error:', error);
     console.error('Error stack:', error.stack);
-
-    if (streamStarted) {
-      sendSSE(res, {
-        error: error.message || 'Internal server error'
-      });
-      endSSE(res);
-      return;
-    }
 
     return res.status(500).json({
       success: false,
