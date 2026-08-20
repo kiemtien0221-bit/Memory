@@ -100,7 +100,7 @@ export default async function handler(req, res) {
         if (inputHash !== existingUser.passwordHash) {
           return res.status(401).json({
             success: false,
-            error: 'Mật khẩu không đúng'
+            error: 'Tên người dùng đã tồn tại. Nếu đây là tài khoản của bạn, hãy nhập đúng mật khẩu'
           });
         }
       }
