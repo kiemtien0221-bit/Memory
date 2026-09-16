@@ -19,7 +19,7 @@ if (REDIS_ENABLED) {
 const memoryStore = new Map();
 
 // Bỏ setInterval (vô hiệu trên Vercel serverless).
-// Thay bằng inline cleanup trong handler, chạy xác suất 1% mỗi request.
+// Thay = inline cleanup trong handler, chạy xác suất 1% mỗi request.
 function maybeCleanupMemoryStore() {
   if (!REDIS_ENABLED && memoryStore.size > 1000 && Math.random() < 0.01) {
     const entries = [...memoryStore.entries()];
