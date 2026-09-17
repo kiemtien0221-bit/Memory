@@ -15,7 +15,7 @@ if (REDIS_ENABLED) {
   }
 }
 
-// TTL constants (đồng bộ với chat.js)
+// TTL constants (đồng bộ chat.js)
 const AUTH_TTL_SECONDS = 365 * 86400;      // 365 ngày - giống user:profile
 const SESSION_TTL_SECONDS = 30 * 86400;    // 30 ngày - giống chat history
 const MAPPING_TTL_SECONDS = 365 * 86400;   // 365 ngày - giống auth:user
