@@ -1066,7 +1066,7 @@ async function handleVisionRequest(req, res) {
 
     const chatCompletion = await callTempGroqWithRetry(userId, async (groq) => {
       return groq.chat.completions.create({
-        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
+        model: 'qwen/qwen3.8-27b',
         messages: [
           {
             role: 'system',
