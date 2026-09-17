@@ -6,7 +6,6 @@
   "main": "api/chat.js",
   "scripts": {
     "dev": "vercel dev",
-    "build": "echo 'No build needed for serverless'",
     "start": "vercel dev"
   },
   "dependencies": {
