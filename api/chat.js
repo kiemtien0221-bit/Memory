@@ -1,6 +1,7 @@
 import Groq from 'groq-sdk';
 import { Redis } from '@upstash/redis';
 import axios from 'axios';
+import sharp from 'sharp';
 
 let redis = null;
 const REDIS_ENABLED = process.env.UPSTASH_REDIS_URL && process.env.UPSTASH_REDIS_TOKEN;
@@ -974,6 +975,50 @@ async function callTempGroqWithRetry(userId, fn) {
 }
 
 // ============ VISION HANDLER ============
+
+// Nén/resize ảnh trước khi gửi cho Groq để tránh lỗi 413/429 "request too large".
+// Groq giới hạn base64 request ~4MB cho model vision (Scout/Maverick) -> nhắm mục
+// tiêu output an toàn dưới ~2.5MB base64 (~1.9MB ảnh gốc) bằng cách giảm dần
+// resolution + JPEG quality. Trả về {buffer, mimeType} đã nén (luôn JPEG sau khi nén,
+// vì JPEG nén tốt hơn PNG cho ảnh chụp thường, và Groq không quan tâm mimeType gốc).
+const VISION_TARGET_BASE64_BYTES = 2.5 * 1024 * 1024; // ~2.5MB base64
+const VISION_MAX_DIMENSION = 1568; // vừa đủ chi tiết cho OCR biển hiệu, giảm token ảnh
+
+async function compressImageForVision(rawBuffer, mimeType) {
+  // Ảnh đã đủ nhỏ -> không cần đụng vào, giữ nguyên định dạng gốc
+  const currentBase64Size = Math.ceil(rawBuffer.length / 3) * 4;
+  if (currentBase64Size <= VISION_TARGET_BASE64_BYTES) {
+    return { buffer: rawBuffer, mimeType };
+  }
+
+  let pipeline = sharp(rawBuffer).rotate(); // rotate() tự đọc EXIF orientation, tránh ảnh bị xoay sai
+  const metadata = await pipeline.metadata();
+
+  // Giảm resolution nếu ảnh lớn hơn ngưỡng (giữ tỉ lệ, không phóng to ảnh nhỏ hơn)
+  if ((metadata.width || 0) > VISION_MAX_DIMENSION || (metadata.height || 0) > VISION_MAX_DIMENSION) {
+    pipeline = pipeline.resize(VISION_MAX_DIMENSION, VISION_MAX_DIMENSION, {
+      fit: 'inside',
+      withoutEnlargement: true
+    });
+  }
+
+  // Giảm dần quality JPEG tới khi đạt kích thước mục tiêu (hoặc chạm sàn quality 40)
+  let quality = 80;
+  let outputBuffer = await pipeline.jpeg({ quality, mozjpeg: true }).toBuffer();
+
+  while (outputBuffer.length > VISION_TARGET_BASE64_BYTES * 0.75 && quality > 40) {
+    quality -= 10;
+    outputBuffer = await sharp(rawBuffer)
+      .rotate()
+      .resize(VISION_MAX_DIMENSION, VISION_MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+  }
+
+  console.log(`🗜 Nén ảnh: ${rawBuffer.length}B -> ${outputBuffer.length}B (quality ${quality})`);
+  return { buffer: outputBuffer, mimeType: 'image/jpeg' };
+}
+
 async function handleVisionRequest(req, res) {
   const { imageBase64, mimeType, prompt, userId, conversationId } = req.body;
 
@@ -987,9 +1032,11 @@ async function handleVisionRequest(req, res) {
     return res.status(400).json({ success: false, error: 'Định dạng ảnh không hợp lệ. Chỉ hỗ trợ: jpeg, png, webp, gif' });
   }
 
-  // Giới hạn kích thước ảnh ~5MB base64 (~3.75MB ảnh gốc)
-  if (imageBase64.length > 5 * 1024 * 1024) {
-    return res.status(413).json({ success: false, error: 'Ảnh quá lớn. Tối đa ~3.75MB' });
+  // Giới hạn upload gốc ~15MB base64 (~11MB ảnh gốc) - lớn hơn nữa thì từ chối luôn
+  // vì quá nặng để nén trong thời gian timeout của serverless function.
+  // Ảnh trong khoảng 2.5MB-15MB sẽ được tự động nén ở bước dưới, không bị chặn ở đây nữa.
+  if (imageBase64.length > 15 * 1024 * 1024) {
+    return res.status(413).json({ success: false, error: 'Ảnh quá lớn. Tối đa ~11MB' });
   }
 
   if (!userId || !userId.startsWith('user_')) {
@@ -1003,9 +1050,23 @@ async function handleVisionRequest(req, res) {
       ? prompt.trim()
       : 'Hãy mô tả chi tiết ảnh này bằng tiếng Việt.';
 
+    // Nén ảnh nếu cần trước khi gửi Groq
+    let finalMime = safeMime;
+    let finalBase64 = imageBase64;
+    try {
+      const rawBuffer = Buffer.from(imageBase64, 'base64');
+      const { buffer: compressedBuffer, mimeType: compressedMime } = await compressImageForVision(rawBuffer, safeMime);
+      finalBase64 = compressedBuffer.toString('base64');
+      finalMime = compressedMime;
+    } catch (compressError) {
+      // Nén lỗi (vd ảnh hỏng, sharp không đọc được) -> fallback dùng ảnh gốc,
+      // để Groq tự trả lỗi rõ ràng thay vì chặn cứng ở đây.
+      console.error('⚠ Nén ảnh thất bại, dùng ảnh gốc:', compressError.message);
+    }
+
     const chatCompletion = await callTempGroqWithRetry(userId, async (groq) => {
       return groq.chat.completions.create({
-        model: 'qwen/qwen3.8-27b',
+        model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
         messages: [
           {
             role: 'system',
@@ -1017,7 +1078,7 @@ async function handleVisionRequest(req, res) {
               {
                 type: 'image_url',
                 image_url: {
-                  url: `data:${safeMime};base64,${imageBase64}`
+                  url: `data:${finalMime};base64,${finalBase64}`
                 }
               },
               {
@@ -1028,8 +1089,9 @@ async function handleVisionRequest(req, res) {
           }
         ],
         max_tokens: 1200,
-        temperature: 0.7,
-        reasoning_effort: 'none' // Qwen3.6 hỗ trợ tắt hẳn suy nghĩ -> khớp với yêu cầu "không giải thích quá trình suy nghĩ" ở trên, đỡ tốn token
+        temperature: 0.7
+        // Bỏ reasoning_effort: đây là tham số riêng của model Qwen3.x, Llama 4 Maverick
+        // không hỗ trợ -> để lại có thể bị Groq trả lỗi invalid_request_error.
       });
     });
 
